@@ -14,8 +14,24 @@ public static class Transliterator
         ['я'] = "ya",
     };
 
+    // Official Ukrainian romanization (Cabinet of Ministers resolution No. 55, 2010).
+    private static readonly Dictionary<char, string> UkToLat = new()
+    {
+        ['а'] = "a", ['б'] = "b", ['в'] = "v", ['г'] = "h", ['ґ'] = "g", ['д'] = "d", ['е'] = "e", ['є'] = "ie",
+        ['ж'] = "zh", ['з'] = "z", ['и'] = "y", ['і'] = "i", ['ї'] = "i", ['й'] = "i", ['к'] = "k", ['л'] = "l",
+        ['м'] = "m", ['н'] = "n", ['о'] = "o", ['п'] = "p", ['р'] = "r", ['с'] = "s", ['т'] = "t", ['у'] = "u",
+        ['ф'] = "f", ['х'] = "kh", ['ц'] = "ts", ['ч'] = "ch", ['ш'] = "sh", ['щ'] = "shch", ['ь'] = "", ['ю'] = "iu",
+        ['я'] = "ia", ['\''] = "", ['ʼ'] = "", ['’'] = "",
+    };
+
+    // At the start of a word these letters are romanized differently.
+    private static readonly Dictionary<char, string> UkWordStart = new()
+    {
+        ['є'] = "ye", ['ї'] = "yi", ['й'] = "y", ['ю'] = "yu", ['я'] = "ya",
+    };
+
     // Longest sequences first for greedy matching.
-    private static readonly (string lat, string ru)[] LatToRu =
+    private static readonly (string lat, string cyr)[] LatToRu =
     [
         ("shch", "щ"), ("sch", "щ"), ("zh", "ж"), ("kh", "х"), ("ts", "ц"), ("ch", "ч"), ("sh", "ш"),
         ("yo", "ё"), ("yu", "ю"), ("ya", "я"), ("ye", "е"), ("jo", "ё"), ("ju", "ю"), ("ja", "я"),
@@ -24,18 +40,35 @@ public static class Transliterator
         ("s", "с"), ("t", "т"), ("u", "у"), ("v", "в"), ("w", "в"), ("x", "кс"), ("y", "ы"), ("z", "з"),
     ];
 
-    /// <summary>Cyrillic → Latin if the text is mostly Cyrillic, otherwise Latin → Cyrillic.</summary>
-    public static string Transliterate(string text) =>
-        LayoutMap.DetectScript(text) == Lang.Ru ? ToLatin(text) : ToCyrillic(text);
+    private static readonly (string lat, string cyr)[] LatToUk =
+    [
+        ("shch", "щ"), ("zgh", "зг"), ("zh", "ж"), ("kh", "х"), ("ts", "ц"), ("ch", "ч"), ("sh", "ш"),
+        ("yu", "ю"), ("ya", "я"), ("ye", "є"), ("yi", "ї"), ("iu", "ю"), ("ia", "я"), ("ie", "є"),
+        ("a", "а"), ("b", "б"), ("c", "ц"), ("d", "д"), ("e", "е"), ("f", "ф"), ("g", "ґ"), ("h", "г"), ("i", "і"),
+        ("j", "й"), ("k", "к"), ("l", "л"), ("m", "м"), ("n", "н"), ("o", "о"), ("p", "п"), ("q", "к"), ("r", "р"),
+        ("s", "с"), ("t", "т"), ("u", "у"), ("v", "в"), ("w", "в"), ("x", "кс"), ("y", "и"), ("z", "з"),
+    ];
 
-    public static string ToLatin(string text)
+    /// <summary>Cyrillic → Latin if the text is mostly Cyrillic, otherwise Latin → Cyrillic (Russian or Ukrainian).</summary>
+    public static string Transliterate(string text, Lang preferredCyrillic = Lang.Ru)
     {
+        var script = LayoutMap.DetectScript(text, preferredCyrillic);
+        return script is Lang.Ru or Lang.Uk ? ToLatin(text, script.Value) : ToCyrillic(text, preferredCyrillic);
+    }
+
+    public static string ToLatin(string text, Lang from = Lang.Ru)
+    {
+        var table = from == Lang.Uk ? UkToLat : RuToLat;
         var sb = new StringBuilder(text.Length * 2);
         for (int i = 0; i < text.Length; i++)
         {
             var c = text[i];
             var lower = char.ToLowerInvariant(c);
-            if (!RuToLat.TryGetValue(lower, out var t)) { sb.Append(c); continue; }
+            bool wordStart = i == 0 || !char.IsLetter(text[i - 1]) && text[i - 1] is not ('\'' or 'ʼ' or '’');
+            string? t;
+            if (from == Lang.Uk && wordStart && UkWordStart.TryGetValue(lower, out var ws)) t = ws;
+            else if (from == Lang.Uk && lower == 'г' && i > 0 && char.ToLowerInvariant(text[i - 1]) == 'з') t = "gh"; // зг → zgh
+            else if (!table.TryGetValue(lower, out t)) { sb.Append(c); continue; }
             if (char.IsUpper(c) && t.Length > 0)
             {
                 // "ЩИ" → "SHCHI", "Щи" → "Shchi"
@@ -50,19 +83,20 @@ public static class Transliterator
         return sb.ToString();
     }
 
-    public static string ToCyrillic(string text)
+    public static string ToCyrillic(string text, Lang to = Lang.Ru)
     {
+        var table = to == Lang.Uk ? LatToUk : LatToRu;
         var sb = new StringBuilder(text.Length);
         int i = 0;
         while (i < text.Length)
         {
             bool matched = false;
-            foreach (var (lat, ru) in LatToRu)
+            foreach (var (lat, cyr) in table)
             {
                 if (i + lat.Length > text.Length) continue;
                 var chunk = text.Substring(i, lat.Length);
                 if (!chunk.Equals(lat, StringComparison.OrdinalIgnoreCase)) continue;
-                sb.Append(char.IsUpper(chunk[0]) ? ru.ToUpperInvariant() : ru);
+                sb.Append(char.IsUpper(chunk[0]) ? char.ToUpperInvariant(cyr[0]) + cyr[1..] : cyr);
                 i += lat.Length;
                 matched = true;
                 break;

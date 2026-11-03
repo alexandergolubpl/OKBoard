@@ -12,6 +12,27 @@ public enum HotkeyAction
     Transliterate,
     ToggleDoNotDisturb,
     AddException,
+    ClipboardHistory,
+}
+
+/// <summary>Text expansion: typing <see cref="Abbr"/> followed by Space/Enter replaces it with <see cref="Text"/>.</summary>
+public sealed class Snippet
+{
+    public string Abbr { get; set; } = "";
+    public string Text { get; set; } = "";
+}
+
+public static class Snippets
+{
+    /// <summary>Substitute {date}, {time}, {datetime}.</summary>
+    public static string Expand(string text, DateTime? now = null)
+    {
+        var t = now ?? DateTime.Now;
+        return text
+            .Replace("{datetime}", t.ToString("dd.MM.yyyy HH:mm"))
+            .Replace("{date}", t.ToString("dd.MM.yyyy"))
+            .Replace("{time}", t.ToString("HH:mm"));
+    }
 }
 
 public sealed class Settings
@@ -29,6 +50,11 @@ public sealed class Settings
     /// <summary>Don't auto-correct a lone word followed by Enter/Tab (that's how passwords are typed in browsers).</summary>
     public bool SkipSingleWordBeforeEnter { get; set; } = true;
     public bool ReselectAfterConvert { get; set; } = true;
+    public bool SnippetsEnabled { get; set; } = true;
+    public bool ClipboardHistoryEnabled { get; set; } = true;
+    public int ClipboardHistorySize { get; set; } = 30;
+
+    public List<Snippet> Snippets { get; set; } = [];
 
     public Dictionary<HotkeyAction, string> Hotkeys { get; set; } = DefaultHotkeys();
 
@@ -39,7 +65,7 @@ public sealed class Settings
     /// <summary>Words that are never auto-converted (lower case, any layout).</summary>
     public List<string> ExceptionWords { get; set; } = [];
 
-    /// <summary>Process name → layout ("en"/"ru") applied when the app comes to the foreground.</summary>
+    /// <summary>Process name → layout ("en"/"ru"/"uk") applied when the app comes to the foreground.</summary>
     public Dictionary<string, string> AppLayouts { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
     public static Dictionary<HotkeyAction, string> DefaultHotkeys() => new()
@@ -51,6 +77,16 @@ public sealed class Settings
         [HotkeyAction.Transliterate] = "Ctrl+Alt+T",
         [HotkeyAction.ToggleDoNotDisturb] = "Ctrl+Alt+F12",
         [HotkeyAction.AddException] = "Ctrl+Alt+X",
+        [HotkeyAction.ClipboardHistory] = "Ctrl+Alt+V",
+    };
+
+    /// <summary>"en" / "ru" / "uk" (also "ua") → layout.</summary>
+    public static Lang? ParseLang(string? s) => s?.Trim().ToLowerInvariant() switch
+    {
+        "en" => Lang.En,
+        "ru" => Lang.Ru,
+        "uk" or "ua" => Lang.Uk,
+        _ => null,
     };
 
     public static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "OKBoard");

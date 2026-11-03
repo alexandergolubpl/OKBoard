@@ -4,7 +4,8 @@ namespace OKBoard;
 
 internal sealed class SettingsForm : Form
 {
-    public const int LogTab = 4;
+    public const int LogTab = 5;
+    private const int ExceptionsTabIndex = 3;
 
     private readonly Settings _s;
     private readonly Engine _engine;
@@ -24,12 +25,19 @@ internal sealed class SettingsForm : Form
         [HotkeyAction.Transliterate] = "Транслитерация (привет ⇄ privet)",
         [HotkeyAction.ToggleDoNotDisturb] = "Режим «Не беспокоить» вкл/выкл",
         [HotkeyAction.AddException] = "Добавить последнее слово в исключения",
+        [HotkeyAction.ClipboardHistory] = "История буфера обмена",
     };
 
-    public SettingsForm(Settings settings, Engine engine)
+    private readonly Action _applyHistory;
+    private readonly List<Snippet> _snips;
+    private readonly NumericUpDown _historySize = new() { Minimum = 5, Maximum = 200, Width = 70 };
+
+    public SettingsForm(Settings settings, Engine engine, Action applyHistory)
     {
         _s = settings;
         _engine = engine;
+        _applyHistory = applyHistory;
+        _snips = settings.Snippets.Select(x => new Snippet { Abbr = x.Abbr, Text = x.Text }).ToList();
         Text = "OKBoard — настройки";
         Font = new Font("Segoe UI", 9.5f);
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -41,6 +49,7 @@ internal sealed class SettingsForm : Form
 
         _tabs.TabPages.Add(GeneralTab());
         _tabs.TabPages.Add(HotkeysTab());
+        _tabs.TabPages.Add(SnippetsTab());
         _tabs.TabPages.Add(ExceptionsTab());
         _tabs.TabPages.Add(AppLayoutsTab());
         _tabs.TabPages.Add(LogTabPage());
@@ -99,6 +108,15 @@ internal sealed class SettingsForm : Form
         AddCheck(p, "Не исправлять одиночное слово перед Enter/Tab", "Так вводят пароли и логины в браузерах, где поле пароля не распознать. Исправить вручную можно горячей клавишей.", _s.SkipSingleWordBeforeEnter, v => _s.SkipSingleWordBeforeEnter = v);
         AddCheck(p, "Оставлять текст выделенным после преобразования", "Позволяет нажимать горячую клавишу регистра несколько раз подряд.", _s.ReselectAfterConvert, v => _s.ReselectAfterConvert = v);
         AddCheck(p, "Тихий звук при автоисправлении", null, _s.SoundOnAutoSwitch, v => _s.SoundOnAutoSwitch = v);
+        AddCheck(p, "Вести историю буфера обмена (Ctrl+Alt+V)",
+            "Только текст и только в памяти — после выхода из программы история исчезает. Не записывается то, что " +
+            "менеджеры паролей помечают как приватное, и то, что скопировано в приложениях-исключениях.",
+            _s.ClipboardHistoryEnabled, v => _s.ClipboardHistoryEnabled = v);
+        var sizeRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(20, 0, 3, 6) };
+        sizeRow.Controls.Add(new Label { Text = "Хранить записей:", AutoSize = true, Margin = new Padding(3, 6, 3, 3) });
+        _historySize.Value = Math.Clamp(_s.ClipboardHistorySize, 5, 200);
+        sizeRow.Controls.Add(_historySize);
+        p.Controls.Add(sizeRow);
         try { _autostart.Checked = Autostart.Enabled; } catch { }
         _autostart.Margin = new Padding(3, 12, 3, 3);
         p.Controls.Add(_autostart);
@@ -137,6 +155,100 @@ internal sealed class SettingsForm : Form
         hint.Margin = new Padding(3, 8, 3, 3);
         t.Controls.Add(hint);
         t.SetColumnSpan(hint, 3);
+        page.Controls.Add(t);
+        return page;
+    }
+
+    private TabPage SnippetsTab()
+    {
+        var page = new TabPage("Автозамена");
+        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3, Padding = new Padding(8) };
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 220));
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var enabled = new CheckBox { Text = "Заменять сокращения после пробела или Enter", Checked = _s.SnippetsEnabled, AutoSize = true };
+        _checks.Add((enabled, v => _s.SnippetsEnabled = v));
+        var head = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false };
+        head.Controls.Add(enabled);
+        head.Controls.Add(Hint("Сокращение срабатывает в любой раскладке («мк» сработает, даже если набрано как «vr»). " +
+                               "Backspace сразу после замены вернёт сокращение. Можно использовать {date}, {time}, {datetime}. " +
+                               "Многострочный текст вставляется через буфер обмена (ваш буфер сохраняется)."));
+        t.Controls.Add(head, 0, 0);
+        t.SetColumnSpan(head, 2);
+
+        var list = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
+        var abbr = new TextBox { Dock = DockStyle.Top, PlaceholderText = "Сокращение, например: мк" };
+        var text = new TextBox
+        {
+            Dock = DockStyle.Fill, Multiline = true, AcceptsReturn = true, AcceptsTab = true, ScrollBars = ScrollBars.Vertical,
+            PlaceholderText = "Полный текст. Например:\r\nС уважением,\r\nАлександр",
+        };
+        var right = new Panel { Dock = DockStyle.Fill };
+        right.Controls.Add(text);
+        right.Controls.Add(new Panel { Dock = DockStyle.Top, Height = 6 });
+        right.Controls.Add(abbr);
+        t.Controls.Add(list, 0, 1);
+        t.Controls.Add(right, 1, 1);
+
+        bool loading = false;
+        string Display(Snippet x)
+        {
+            var first = x.Text.Replace("\r\n", "\n").Split('\n')[0];
+            if (first.Length > 30) first = first[..30] + "…";
+            return $"{(x.Abbr.Length > 0 ? x.Abbr : "(новое)")} → {first}";
+        }
+        void Rebuild(int select)
+        {
+            loading = true;
+            list.Items.Clear();
+            foreach (var x in _snips) list.Items.Add(Display(x));
+            list.SelectedIndex = Math.Min(select, list.Items.Count - 1);
+            loading = false;
+            LoadCurrent();
+        }
+        void LoadCurrent()
+        {
+            loading = true;
+            var cur = list.SelectedIndex >= 0 ? _snips[list.SelectedIndex] : null;
+            abbr.Text = cur?.Abbr ?? "";
+            text.Text = cur?.Text.Replace("\r\n", "\n").Replace("\n", Environment.NewLine) ?? "";
+            abbr.Enabled = text.Enabled = cur != null;
+            loading = false;
+        }
+        void Store()
+        {
+            if (loading || list.SelectedIndex < 0) return;
+            var cur = _snips[list.SelectedIndex];
+            cur.Abbr = abbr.Text.Trim();
+            cur.Text = text.Text.Replace("\r\n", "\n");
+            loading = true;
+            list.Items[list.SelectedIndex] = Display(cur);
+            loading = false;
+        }
+        list.SelectedIndexChanged += (_, _) => { if (!loading) LoadCurrent(); };
+        abbr.TextChanged += (_, _) => Store();
+        text.TextChanged += (_, _) => Store();
+
+        var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
+        var add = new Button { Text = "Добавить", AutoSize = true };
+        var del = new Button { Text = "Удалить", AutoSize = true };
+        add.Click += (_, _) => { _snips.Add(new Snippet()); Rebuild(_snips.Count - 1); abbr.Focus(); };
+        del.Click += (_, _) =>
+        {
+            if (list.SelectedIndex < 0) return;
+            int i = list.SelectedIndex;
+            _snips.RemoveAt(i);
+            Rebuild(Math.Max(0, i - 1));
+        };
+        buttons.Controls.Add(add);
+        buttons.Controls.Add(del);
+        t.Controls.Add(buttons, 0, 2);
+        t.SetColumnSpan(buttons, 2);
+
+        Rebuild(0);
         page.Controls.Add(t);
         return page;
     }
@@ -184,7 +296,7 @@ internal sealed class SettingsForm : Form
         {
             AutoSize = true, MaximumSize = new Size(700, 0),
             Text = "При переключении на приложение сразу включать нужную раскладку. Формат: программа.exe = en или ru\n" +
-                   "Например:  Telegram.exe = ru,  Code.exe = en,  WindowsTerminal.exe = en",
+                   "Например:  Telegram.exe = ru,  Viber.exe = uk,  Code.exe = en,  WindowsTerminal.exe = en",
         });
         _appLayouts.Text = string.Join(Environment.NewLine, _s.AppLayouts.Select(kv => $"{kv.Key} = {kv.Value}"));
         t.Controls.Add(_appLayouts);
@@ -212,7 +324,7 @@ internal sealed class SettingsForm : Form
                     var w = e.From.Trim().Trim('.', ',', '!', '?', ';', ':', '"', '\'').ToLowerInvariant();
                     if (w.Length > 0 && !_words.Lines.Contains(w)) _words.AppendText((_words.Text.Length > 0 ? Environment.NewLine : "") + w);
                 }
-            _tabs.SelectedIndex = 2;
+            _tabs.SelectedIndex = ExceptionsTabIndex;
         };
         bar.Controls.Add(never);
         bar.Controls.Add(new Label { Text = "Журнал хранится только в памяти до выхода из программы.", AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(8, 8, 3, 3) });
@@ -257,11 +369,18 @@ internal sealed class SettingsForm : Form
         foreach (var line in Lines(_appLayouts))
         {
             var parts = line.Split('=', 2, StringSplitOptions.TrimEntries);
-            if (parts.Length == 2 && parts[1].ToLowerInvariant() is "en" or "ru") _s.AppLayouts[parts[0]] = parts[1].ToLowerInvariant();
+            if (parts.Length == 2 && Settings.ParseLang(parts[1]) is { } lang) _s.AppLayouts[parts[0]] = lang.ToString().ToLowerInvariant();
         }
+        _s.ClipboardHistorySize = (int)_historySize.Value;
+        _s.Snippets = _snips
+            .Where(x => !string.IsNullOrWhiteSpace(x.Abbr) && x.Text.Length > 0)
+            .GroupBy(x => x.Abbr.Trim(), StringComparer.OrdinalIgnoreCase)
+            .Select(g => new Snippet { Abbr = g.Key, Text = g.First().Text.Replace("\r\n", "\n") })
+            .ToList();
         try { Autostart.Enabled = _autostart.Checked; } catch { }
         _s.Save();
         _engine.ReloadSettings();
+        _applyHistory();
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)

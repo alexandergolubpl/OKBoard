@@ -7,7 +7,8 @@ public sealed record CorrectionEntry(DateTime Time, string App, string From, str
 
 /// <summary>
 /// Core of the switcher: watches keystrokes, keeps a buffer of the current line, auto-corrects words typed in
-/// the wrong layout and executes hotkey actions. Everything runs on the UI thread (hooks are delivered there).
+/// the wrong layout, expands abbreviations and executes hotkey actions. Everything runs on the UI thread
+/// (low-level hooks are delivered there).
 /// </summary>
 internal sealed class Engine : IDisposable
 {
@@ -20,6 +21,7 @@ internal sealed class Engine : IDisposable
     private readonly SynchronizationContext _ui;
     private readonly HashSet<string> _exceptions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<Hotkey, HotkeyAction> _hotkeys = new();
+    private readonly Dictionary<string, Snippet> _snippets = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly List<KeyStroke> _line = [];
     private readonly HashSet<ushort> _held = [];
@@ -27,11 +29,13 @@ internal sealed class Engine : IDisposable
     private bool _shiftDown, _shiftAlone;
     private long _lastShiftTap;
     private Lang? _wordStartLang;
+    private Lang? _lastCyrillic;
     private AutoFix? _lastAuto;
+    private ManualCycle? _cycle;
     private bool _busy;
     private bool _savePending;
     private readonly DelayedClipboard _clipboard = new();
-    private const int MaxSelectionChars = 200_000, MaxReselectChars = 5_000;
+    private const int MaxSelectionChars = 200_000, MaxReselectChars = 5_000, MaxTypedSnippet = 300;
 
     private long _fullscreenCheckedAt;
     private bool _fullscreenCached;
@@ -46,16 +50,25 @@ internal sealed class Engine : IDisposable
     public DateTime DndUntil { get; private set; } = DateTime.MinValue;
     public bool IsDnd => DateTime.Now < DndUntil;
     public bool IsFullscreenPaused => _s.PauseInFullscreen && IsFullscreen();
-    /// <summary>Set while a settings hotkey box has focus, so hotkeys reach it.</summary>
+    /// <summary>Set while one of our own input windows has focus (hotkey box, clipboard popup).</summary>
     public bool Suspended { get; set; }
+    /// <summary>True while we are copying/pasting on the user's behalf (clipboard history ignores those copies).</summary>
+    public bool Busy => _busy;
 
     public List<CorrectionEntry> Log { get; } = [];
-    /// <summary>Diagnostics sink (errors, skipped operations).</summary>
+    /// <summary>Diagnostics sink (errors, skipped operations). Never receives typed or copied text.</summary>
     public static Action<string>? Trace;
     public event Action<string>? Notify;
     public event Action? StateChanged;
+    /// <summary>The clipboard history hotkey was pressed; argument is the window to paste into.</summary>
+    public event Action<IntPtr>? ClipboardHistoryRequested;
 
-    private sealed record AutoFix(List<KeyStroke> OriginalKeys, int Count, Lang From, bool Switched, string Original, string Converted);
+    /// <param name="ConvertedLength">Characters to delete to undo (newlines count as one).</param>
+    private sealed record AutoFix(List<KeyStroke> OriginalKeys, int ConvertedLength, Lang From, bool Switched,
+        string Original, string Converted, bool IsSnippet);
+
+    /// <summary>State of repeated Pause presses on the same word: cycle through the installed layouts.</summary>
+    private sealed record ManualCycle(int Start, int Count, List<Lang> Sequence, int Index);
 
     public Engine(Settings settings, LanguageDetector detector, LayoutManager layouts)
     {
@@ -122,6 +135,9 @@ internal sealed class Engine : IDisposable
         _hotkeys.Clear();
         foreach (var (action, text) in _s.Hotkeys)
             if (Hotkey.Parse(text) is { IsSafe: true } hk) _hotkeys.TryAdd(hk, action);
+        _snippets.Clear();
+        foreach (var sn in _s.Snippets)
+            if (!string.IsNullOrWhiteSpace(sn.Abbr) && !string.IsNullOrEmpty(sn.Text)) _snippets.TryAdd(sn.Abbr.Trim(), sn);
     }
 
     // ───────────────────────────── public commands (tray menu etc.) ─────────────────────────────
@@ -169,6 +185,10 @@ internal sealed class Engine : IDisposable
 
     public Lang? CurrentLang => _layouts.Current();
 
+    /// <summary>The Cyrillic layout to use when converting Latin text: the one used last, else the first installed.</summary>
+    private Lang PreferredCyrillic() =>
+        _lastCyrillic is { } l && _layouts.Has(l) ? l : _layouts.Installed.FirstOrDefault(LayoutMap.IsCyrillicLang, Lang.Ru);
+
     // ───────────────────────────── hooks ─────────────────────────────
 
     private IntPtr KeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
@@ -215,9 +235,8 @@ internal sealed class Engine : IDisposable
     {
         ResetLine();
         var name = GetProcessName(hwnd);
-        if (name != null && _s.AppLayouts.TryGetValue(name, out var l))
+        if (name != null && _s.AppLayouts.TryGetValue(name, out var l) && Settings.ParseLang(l) is { } lang)
         {
-            var lang = l.Trim().ToLowerInvariant() == "ru" ? Lang.Ru : Lang.En;
             // Give the window a moment to finish activating before changing its layout.
             Task.Delay(120).ContinueWith(_ => _ui.Post(_ => _layouts.Switch(lang, hwnd), null));
         }
@@ -282,6 +301,8 @@ internal sealed class Engine : IDisposable
             return true;
         }
 
+        _cycle = null; // any other key ends a Pause-cycle
+
         if (CtrlHeld || AltHeld || WinHeld)
         {
             ResetLine(); // a shortcut (Ctrl+V, Alt+Tab...) — we no longer know what is around the caret
@@ -306,7 +327,11 @@ internal sealed class Engine : IDisposable
         if (LayoutMap.IsCharKey(vk))
         {
             _lastAuto = null;
-            if (WordRange().count == 0) _wordStartLang = _layouts.Current();
+            if (WordRange().count == 0)
+            {
+                _wordStartLang = _layouts.Current();
+                if (_wordStartLang is { } l && LayoutMap.IsCyrillicLang(l)) _lastCyrillic = l;
+            }
             _line.Add(new KeyStroke(vk, ShiftHeld, _caps));
             if (_line.Count > 400) _line.RemoveRange(0, 200);
             return false;
@@ -345,6 +370,7 @@ internal sealed class Engine : IDisposable
     {
         _line.Clear();
         _lastAuto = null;
+        _cycle = null;
         _wordStartLang = null;
     }
 
@@ -368,6 +394,8 @@ internal sealed class Engine : IDisposable
         return wordEnd == i ? (0, 0) : (i, _line.Count - i);
     }
 
+    private static int VisibleLength(string s) => s.Replace("\r\n", "\n").Length;
+
     // ───────────────────────────── auto-correction ─────────────────────────────
 
     private string? ForegroundProcess()
@@ -380,9 +408,12 @@ internal sealed class Engine : IDisposable
     public bool IsExcludedApp(string? proc) =>
         proc != null && _s.ExcludedApps.Any(a => a.Trim().Equals(proc, StringComparison.OrdinalIgnoreCase));
 
+    private bool InPasswordField() => _s.SkipPasswordFields && LayoutManager.IsPasswordField();
+
     private bool AutoAllowed() =>
-        _s.AutoSwitch && !IsDnd && !IsExcludedApp(ForegroundProcess()) &&
-        !(_s.SkipPasswordFields && LayoutManager.IsPasswordField());
+        _s.AutoSwitch && !IsDnd && !IsExcludedApp(ForegroundProcess()) && !InPasswordField();
+
+    private bool SnippetsAllowed() => _s.SnippetsEnabled && _snippets.Count > 0 && !IsDnd && !InPasswordField();
 
     private bool IsFullscreen()
     {
@@ -400,6 +431,8 @@ internal sealed class Engine : IDisposable
     {
         _lastAuto = null;
         var (start, count) = WordRange();
+        if (count > 0 && SnippetsAllowed() && TryExpandSnippet(start, count, vk)) return true;
+
         bool swallow = false;
         // A single token followed by Enter/Tab is how passwords and logins are typed (browsers don't expose
         // password fields to us). Never rewrite it — the user can still press the hotkey manually.
@@ -407,20 +440,22 @@ internal sealed class Engine : IDisposable
         if (count > 0 && !singleTokenSubmit && AutoAllowed() && _layouts.Current() is { } cur && (_wordStartLang == null || _wordStartLang == cur))
         {
             var word = _line.GetRange(start, count);
-            var d = _detector.Analyze(word, cur);
+            var d = _detector.AnalyzeBest(word, cur, _layouts.Installed, PreferredCyrillic());
             var newKeys = word;
             var renderLang = cur;
             var kinds = new List<string>();
             if (d.Convert)
             {
-                renderLang = LayoutMap.Other(cur);
+                renderLang = d.Target;
                 kinds.Add("раскладка");
             }
             var text = LayoutMap.Render(newKeys, renderLang);
             bool capsOff = false;
             if (_s.FixCapsLockAccident && _caps && CaseTools.LooksLikeCapsAccident(text))
             {
-                newKeys = newKeys.Select(k => LayoutMap.WithCase(k, !char.IsUpper(LayoutMap.CharFor(k, renderLang) ?? 'a'))).ToList();
+                // flip the case of letters only — punctuation keys must stay as they are
+                newKeys = newKeys.Select(k => LayoutMap.CharFor(k, renderLang) is { } c && char.IsLetter(c)
+                    ? LayoutMap.WithCase(k, !char.IsUpper(c)) : k).ToList();
                 capsOff = true;
                 kinds.Add("Caps Lock");
             }
@@ -431,7 +466,8 @@ internal sealed class Engine : IDisposable
                 kinds.Add("ДВе заглавные");
             }
             var newText = LayoutMap.Render(newKeys, renderLang);
-            if (newText != d.Current)
+            var oldText = LayoutMap.Render(word, cur);
+            if (newText != oldText)
             {
                 InputSender.ReleaseModifiers(_held.Where(v => v is 0xA0 or 0xA1));
                 InputSender.Backspace(count);
@@ -444,8 +480,8 @@ internal sealed class Engine : IDisposable
                 _line.RemoveRange(start, count);
                 _line.InsertRange(start, newKeys);
                 if (vk == VK_SPACE)
-                    _lastAuto = new AutoFix(word, count, cur, renderLang != cur, d.Current, newText);
-                AddLog(d.Current, newText, string.Join(", ", kinds));
+                    _lastAuto = new AutoFix(word, count, cur, renderLang != cur, oldText, newText, false);
+                AddLog(oldText, newText, string.Join(", ", kinds));
                 if (_s.SoundOnAutoSwitch) Task.Run(() => Console.Beep(1400, 25));
             }
         }
@@ -455,17 +491,82 @@ internal sealed class Engine : IDisposable
         return swallow;
     }
 
+    /// <summary>Abbreviation typed in any installed layout (so "мк" works even if typed as "vr").</summary>
+    private (Snippet sn, string typed)? FindSnippet(List<KeyStroke> keys)
+    {
+        var cur = _layouts.Current();
+        var order = cur is { } c ? _layouts.Installed.OrderBy(l => l == c ? 0 : 1) : _layouts.Installed.AsEnumerable();
+        foreach (var l in order)
+        {
+            var typed = LayoutMap.Render(keys, l);
+            if (_snippets.TryGetValue(typed, out var sn)) return (sn, LayoutMap.Render(keys, cur ?? l));
+        }
+        return null;
+    }
+
+    private bool TryExpandSnippet(int start, int count, ushort vk)
+    {
+        var word = _line.GetRange(start, count);
+        if (FindSnippet(word) is not { } found) return false;
+        var (sn, typed) = found;
+        var text = Snippets.Expand(sn.Text);
+        bool needsPaste = text.Contains('\n') || text.Length > MaxTypedSnippet;
+        var fg = GetForegroundWindow();
+        if (needsPaste && IsTerminal(fg)) return false; // a newline pasted into a shell would execute it
+
+        InputSender.ReleaseModifiers(_held.Where(v => v is 0xA0 or 0xA1));
+        InputSender.Backspace(count);
+        if (needsPaste)
+        {
+            _ui.Post(async _ =>
+            {
+                try
+                {
+                    _busy = true;
+                    if (!await PasteViaClipboard(text, fg))
+                    {
+                        // Couldn't paste (clipboard locked / window changed): put the abbreviation back.
+                        if (GetForegroundWindow() == fg) InputSender.Text(typed);
+                        Notify?.Invoke("Не удалось вставить текст автозамены");
+                        return;
+                    }
+                    InputSender.Tap(vk);
+                }
+                finally { _busy = false; }
+            }, null);
+        }
+        else
+        {
+            InputSender.Text(text);
+            InputSender.Tap(vk);
+        }
+
+        ResetLine();
+        if (vk == VK_SPACE)
+            _lastAuto = new AutoFix(word, VisibleLength(text), _layouts.Current() ?? Lang.En, false, typed, text, true);
+        AddLog(typed, Shorten(text), "автозамена");
+        return true;
+    }
+
     private void UndoAuto()
     {
         var a = _lastAuto!;
         _lastAuto = null;
-        InputSender.Backspace(a.Count + 1);
+        InputSender.Backspace(a.ConvertedLength + 1);
         InputSender.Text(a.Original + " ");
         if (a.Switched) _layouts.Switch(a.From);
-        int start = _line.Count - 1 - a.Count;
+        if (a.IsSnippet)
+        {
+            ResetLine();
+            _line.AddRange(a.OriginalKeys);
+            _line.Add(new KeyStroke(VK_SPACE, false));
+            AddLog(Shorten(a.Converted), a.Original, "отмена автозамены");
+            return;
+        }
+        int start = _line.Count - 1 - a.OriginalKeys.Count;
         if (start >= 0)
         {
-            _line.RemoveRange(start, a.Count);
+            _line.RemoveRange(start, a.OriginalKeys.Count);
             _line.InsertRange(start, a.OriginalKeys);
         }
         if (a.Switched && _s.LearnFromUndo)
@@ -486,8 +587,11 @@ internal sealed class Engine : IDisposable
 
     public void ToggleLayout()
     {
-        var cur = _layouts.Current() ?? Lang.Ru;
-        _layouts.Switch(LayoutMap.Other(cur));
+        var installed = _layouts.Installed;
+        if (installed.Count == 0) return;
+        var cur = _layouts.Current();
+        int i = cur is { } c ? installed.IndexOf(c) : -1;
+        _layouts.Switch(installed[(i + 1) % installed.Count]);
         StateChanged?.Invoke();
     }
 
@@ -502,25 +606,29 @@ internal sealed class Engine : IDisposable
             switch (action)
             {
                 case HotkeyAction.ConvertLastWord:
-                    if (!RetypeLast(phrase: false)) await TransformSelection(s => LayoutMap.ConvertText(s), true, fg, explicitSelection: false);
+                    if (!RetypeLast(phrase: false)) await TransformSelection(ConvertSelectionText, true, fg, explicitSelection: false);
                     break;
                 case HotkeyAction.ConvertPhrase:
-                    if (!RetypeLast(phrase: true)) await TransformSelection(s => LayoutMap.ConvertText(s), true, fg, explicitSelection: false);
+                    if (!RetypeLast(phrase: true)) await TransformSelection(ConvertSelectionText, true, fg, explicitSelection: false);
                     break;
                 case HotkeyAction.ConvertSelection:
-                    await TransformSelection(s => LayoutMap.ConvertText(s), true, fg, explicitSelection: true);
+                    await TransformSelection(ConvertSelectionText, true, fg, explicitSelection: true);
                     break;
                 case HotkeyAction.CycleCase:
                     if (!TransformLastWord(CaseTools.Cycle)) await TransformSelection(CaseTools.Cycle, false, fg, explicitSelection: false);
                     break;
                 case HotkeyAction.Transliterate:
-                    if (!TransformLastWord(Transliterator.Transliterate)) await TransformSelection(Transliterator.Transliterate, false, fg, explicitSelection: false);
+                    string Tr(string t) => Transliterator.Transliterate(t, PreferredCyrillic());
+                    if (!TransformLastWord(Tr)) await TransformSelection(Tr, false, fg, explicitSelection: false);
                     break;
                 case HotkeyAction.ToggleDoNotDisturb:
                     ToggleDnd();
                     break;
                 case HotkeyAction.AddException:
                     AddLastWordToExceptions();
+                    break;
+                case HotkeyAction.ClipboardHistory:
+                    ClipboardHistoryRequested?.Invoke(fg);
                     break;
             }
         }
@@ -534,32 +642,79 @@ internal sealed class Engine : IDisposable
         }
     }
 
+    /// <summary>Selected text typed in the wrong layout: Latin words go to the Cyrillic layout that fits best.</summary>
+    private string ConvertSelectionText(string text)
+    {
+        var cyrillic = _layouts.Installed.Where(LayoutMap.IsCyrillicLang).ToList();
+        var target = PreferredCyrillic();
+        if (cyrillic.Count > 1)
+        {
+            // Score each candidate by how many words become real words, preferring the last used one on ties.
+            target = cyrillic
+                .OrderByDescending(l => _detector.CountValidWords(LayoutMap.ConvertText(text, Lang.En, l), l))
+                .ThenBy(l => l == target ? 0 : 1)
+                .First();
+        }
+        return LayoutMap.ConvertText(text, target);
+    }
+
     private void AddLastWordToExceptions()
     {
         var (start, count) = LastWordWithSpaces();
         if (count == 0) { Notify?.Invoke("Нет последнего слова для исключения"); return; }
         var keys = _line.GetRange(start, count).Where(k => !k.IsSpace).ToList();
-        var cur = _layouts.Current() ?? Lang.En;
-        var w1 = LanguageDetector.Core(LayoutMap.Render(keys, cur), cur);
-        var w2 = LanguageDetector.Core(LayoutMap.Render(keys, LayoutMap.Other(cur)), LayoutMap.Other(cur));
-        AddException(w1);
-        AddException(w2);
-        Notify?.Invoke($"«{w1}» / «{w2}» больше не будут исправляться");
+        var words = _layouts.Installed.Select(l => LanguageDetector.Core(LayoutMap.Render(keys, l), l))
+            .Where(w => w.Length > 0).Distinct().ToList();
+        foreach (var w in words) AddException(w);
+        Notify?.Invoke($"Больше не исправляются: {string.Join(" / ", words.Select(w => $"«{w}»"))}");
     }
 
-    /// <summary>Re-type the last word (or whole line) in the other layout. False if the buffer is empty.</summary>
+    /// <summary>Order in which repeated Pause presses try layouts: the most likely first, the original last.</summary>
+    private List<Lang> BuildCycle(List<KeyStroke> keys, Lang cur)
+    {
+        var word = keys.Where(k => !k.IsSpace).ToList();
+        var pref = PreferredCyrillic();
+        var others = _layouts.Installed.Where(l => l != cur)
+            .OrderByDescending(l =>
+            {
+                var d = _detector.Analyze(word, cur, l);
+                if (d.Convert) return d.Strength + 10;
+                return _detector.IsValid(LanguageDetector.Core(d.Alternative, l), l) ? 5 : 0;
+            })
+            .ThenBy(l => LayoutMap.IsCyrillicLang(l) == LayoutMap.IsCyrillicLang(cur) ? 1 : 0) // Latin↔Cyrillic first
+            .ThenBy(l => l == pref ? 0 : 1)
+            .ToList();
+        if (others.Count == 0) others.Add(cur == Lang.En ? pref : Lang.En);
+        others.Add(cur);
+        return others;
+    }
+
+    /// <summary>Re-type the last word (or whole line) in another layout. False if the buffer is empty.</summary>
     private bool RetypeLast(bool phrase)
     {
         var (start, count) = phrase ? (0, _line.Count) : LastWordWithSpaces();
         if (count == 0 || _line.Skip(start).All(k => k.IsSpace)) return false;
         var keys = _line.GetRange(start, count);
         var cur = _layouts.Current() ?? Lang.En;
-        var target = LayoutMap.Other(cur);
+
+        Lang target;
+        if (_cycle is { } c && c.Start == start && c.Count == count)
+        {
+            int idx = (c.Index + 1) % c.Sequence.Count;
+            target = c.Sequence[idx];
+            _cycle = c with { Index = idx };
+        }
+        else
+        {
+            var seq = BuildCycle(keys, cur);
+            target = seq[0];
+            _cycle = new ManualCycle(start, count, seq, 0);
+        }
         var before = LayoutMap.Render(keys, cur);
         var after = LayoutMap.Render(keys, target);
 
         // Converting back a word we auto-corrected a moment ago means the detector was wrong: learn from it.
-        if (!phrase && _lastAuto is { Switched: true } a && _s.LearnFromUndo)
+        if (!phrase && _lastAuto is { Switched: true, IsSnippet: false } a && _s.LearnFromUndo)
             AddException(LanguageDetector.Core(a.Original, a.From));
         _lastAuto = null;
 
@@ -567,6 +722,7 @@ internal sealed class Engine : IDisposable
         InputSender.Backspace(count);
         InputSender.Text(after);
         _layouts.Switch(target);
+        if (LayoutMap.IsCyrillicLang(target)) _lastCyrillic = target;
         AddLog(before, after, phrase ? "фраза (вручную)" : "слово (вручную)");
         return true;
     }
@@ -602,17 +758,85 @@ internal sealed class Engine : IDisposable
         return true;
     }
 
-    // ───────────────────────────── selection (clipboard) ─────────────────────────────
+    // ───────────────────────────── selection & clipboard ─────────────────────────────
 
     private static readonly string[] TerminalClasses =
         ["ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "mintty", "PuTTY", "VirtualConsoleClass"];
 
-    private static bool IsTerminal(IntPtr hwnd)
+    public static bool IsTerminal(IntPtr hwnd)
     {
         var sb = new System.Text.StringBuilder(128);
         GetClassName(hwnd, sb, sb.Capacity);
         var cls = sb.ToString();
         return TerminalClasses.Any(c => cls.Equals(c, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Paste text into <paramref name="fg"/> and then give the user's clipboard back. The text is offered with
+    /// delayed rendering, so the original clipboard is restored only after the app has really read our text.
+    /// </summary>
+    /// <returns>True if the app read the text.</returns>
+    private async Task<bool> PasteViaClipboard(string text, IntPtr fg, ClipboardBackup? backup = null)
+    {
+        if (backup == null)
+        {
+            await _clipboard.WaitAvailableAsync();
+            backup = ClipboardBackup.Save();
+        }
+        var requested = await _clipboard.OfferAsync(text);
+        if (requested == null) { Trace?.Invoke("paste: clipboard locked"); backup.Restore(); return false; }
+        // Clipboard managers (ClipAngel, Ditto...) grab every change at once and keep the clipboard open for a
+        // moment; if Ctrl+V arrives then, the target app silently fails to open the clipboard. Let them finish.
+        await Task.Delay(40);
+        await _clipboard.WaitAvailableAsync(300);
+        if (GetForegroundWindow() != fg) { Trace?.Invoke("paste: foreground changed"); if (_clipboard.IsOwner) backup.Restore(); return false; }
+        // If such a manager already pulled the data, the "rendered" signal is used up: fall back to a fixed wait.
+        bool renderedEarly = requested.IsCompleted;
+        InputSender.Combo(VK_CONTROL_L, VK_V);
+        bool pasted;
+        if (renderedEarly)
+        {
+            Trace?.Invoke("paste: data was read early by another clipboard monitor");
+            await Task.Delay(500);
+            pasted = true;
+        }
+        else
+        {
+            pasted = await Task.WhenAny(requested, Task.Delay(3000)) == requested;
+            if (!pasted) Trace?.Invoke($"paste: not requested within 3s (owner={_clipboard.IsOwner})");
+        }
+        await Task.Delay(60);
+        if (_clipboard.IsOwner)
+        {
+            await _clipboard.WaitAvailableAsync();
+            backup.Restore(); // only if nobody copied something new meanwhile
+        }
+        return pasted;
+    }
+
+    /// <summary>Paste a clipboard-history item: it becomes the current clipboard content, like Win+V.</summary>
+    public async Task PasteFromHistory(string text, IntPtr fg)
+    {
+        if (_busy || fg == IntPtr.Zero) return;
+        _busy = true;
+        try
+        {
+            SetForegroundWindow(fg);
+            for (int i = 0; i < 10 && GetForegroundWindow() != fg; i++) await Task.Delay(20);
+            if (GetForegroundWindow() != fg) return;
+            for (int i = 0; i < 5; i++)
+            {
+                try { Clipboard.SetText(text, TextDataFormat.UnicodeText); break; }
+                catch (ExternalException) { await Task.Delay(30); }
+            }
+            InputSender.ReleaseModifiers(_held);
+            InputSender.Combo(VK_CONTROL_L, VK_V);
+        }
+        finally
+        {
+            _busy = false;
+            ResetLine();
+        }
     }
 
     /// <param name="explicitSelection">
@@ -633,6 +857,7 @@ internal sealed class Engine : IDisposable
         try
         {
             InputSender.ReleaseModifiers(_held);
+            await _clipboard.WaitAvailableAsync();
             var backup = ClipboardBackup.Save();
             uint seq = GetClipboardSequenceNumber();
             // Ctrl+Insert first: copies in almost every app, and is never an "interrupt".
@@ -659,22 +884,17 @@ internal sealed class Engine : IDisposable
             if (abort) { backup.Restore(); return; }
 
             var result = f(text);
-            var requested = _clipboard.Offer(result);
-            if (requested == null) { backup.Restore(); return; }
-            if (GetForegroundWindow() != fg) { if (_clipboard.IsOwner) backup.Restore(); return; }
-            InputSender.Combo(VK_CONTROL_L, VK_V);
-
-            // Wait until the app has actually read our text (or give up); only then restore the user's clipboard.
-            bool pasted = await Task.WhenAny(requested, Task.Delay(3000)) == requested;
-            await Task.Delay(60);
-            if (pasted && GetForegroundWindow() == fg)
+            if (await PasteViaClipboard(result, fg, backup) && GetForegroundWindow() == fg)
             {
-                int len = result.Replace("\r\n", "\n").Length;
+                int len = VisibleLength(result);
                 if (_s.ReselectAfterConvert && len <= MaxReselectChars) InputSender.SelectLeft(len);
-                if (switchLayout && LayoutMap.DetectScript(result) is { } target) _layouts.Switch(target);
+                if (switchLayout && LayoutMap.DetectScript(result, PreferredCyrillic()) is { } target)
+                {
+                    _layouts.Switch(target);
+                    if (LayoutMap.IsCyrillicLang(target)) _lastCyrillic = target;
+                }
                 AddLog(Shorten(text), Shorten(result), "выделение");
             }
-            if (_clipboard.IsOwner) backup.Restore(); // don't clobber something the user copied meanwhile
         }
         finally
         {
@@ -683,5 +903,9 @@ internal sealed class Engine : IDisposable
         }
     }
 
-    private static string Shorten(string s) => s.Length > 40 ? s[..40] + "…" : s;
+    private static string Shorten(string s)
+    {
+        s = s.Replace("\r\n", " ⏎ ").Replace("\n", " ⏎ ");
+        return s.Length > 40 ? s[..40] + "…" : s;
+    }
 }

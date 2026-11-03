@@ -35,12 +35,17 @@ internal sealed class TrayApp : ApplicationContext
     private string _iconKey = "";
     private Icon? _icon;
     private string? _lastApp;
+    private IntPtr _lastAppHwnd;
     private SettingsForm? _settingsForm;
+    private readonly ClipboardHistory _history;
+    private ClipboardPopup? _popup;
 
     public TrayApp(Settings settings, Engine engine)
     {
         _settings = settings;
         _engine = engine;
+        _history = new ClipboardHistory(_engine.IsExcludedApp, () => _engine.Busy);
+        ApplyHistorySettings();
 
         _statusItem = new ToolStripMenuItem("OKBoard") { Enabled = false };
         _autoItem = new ToolStripMenuItem("Автопереключение раскладки", null, (_, _) =>
@@ -69,6 +74,9 @@ internal sealed class TrayApp : ApplicationContext
             _dndMenu,
             _excludeItem,
             new ToolStripSeparator(),
+            new ToolStripMenuItem("История буфера обмена…", null, (_, _) => ShowClipboardPopup(_lastAppHwnd, atCaret: false)),
+            new ToolStripMenuItem("Очистить историю буфера", null, (_, _) => { _history.Clear(); ShowTip("История буфера обмена очищена"); }),
+            new ToolStripSeparator(),
             new ToolStripMenuItem("Настройки…", null, (_, _) => ShowSettings(0)),
             new ToolStripMenuItem("Журнал исправлений…", null, (_, _) => ShowSettings(SettingsForm.LogTab)),
             _autostartItem,
@@ -81,6 +89,7 @@ internal sealed class TrayApp : ApplicationContext
         _tray.DoubleClick += (_, _) => ShowSettings(0);
         _engine.Notify += ShowTip;
         _engine.StateChanged += () => UpdateIcon(false);
+        _engine.ClipboardHistoryRequested += fg => ShowClipboardPopup(fg, atCaret: true);
 
         _timer = new System.Windows.Forms.Timer { Interval = 250 };
         _timer.Tick += (_, _) => { TrackForegroundApp(); UpdateIcon(false); _engine.CheckHookHealth(); };
@@ -92,10 +101,55 @@ internal sealed class TrayApp : ApplicationContext
 
     private void TrackForegroundApp()
     {
-        var name = Native.GetProcessName(Native.GetForegroundWindow());
+        var fg = Native.GetForegroundWindow();
+        var name = Native.GetProcessName(fg);
         if (name != null && !name.Equals(Path.GetFileName(Environment.ProcessPath), StringComparison.OrdinalIgnoreCase)
             && !name.Equals("explorer.exe", StringComparison.OrdinalIgnoreCase))
+        {
             _lastApp = name;
+            _lastAppHwnd = fg;
+        }
+    }
+
+    public void ApplyHistorySettings()
+    {
+        _history.Enabled = _settings.ClipboardHistoryEnabled;
+        _history.MaxItems = Math.Clamp(_settings.ClipboardHistorySize, 5, 200);
+        if (!_history.Enabled) _history.Clear();
+    }
+
+    /// <summary>Show recent clipboard items next to the caret of <paramref name="target"/>; the pick is pasted there.</summary>
+    private void ShowClipboardPopup(IntPtr target, bool atCaret)
+    {
+        if (!_settings.ClipboardHistoryEnabled)
+        {
+            ShowTip("История буфера обмена выключена в настройках");
+            return;
+        }
+        _popup?.Close();
+        var pos = Cursor.Position;
+        if (atCaret && CaretPosition(target) is { } caret) pos = caret;
+
+        var popup = new ClipboardPopup(_history, text => _ = _engine.PasteFromHistory(text, target));
+        popup.FormClosed += (_, _) =>
+        {
+            _engine.Suspended = false;
+            if (!popup.WasPicked && target != IntPtr.Zero) Native.SetForegroundWindow(target);
+            if (_popup == popup) _popup = null;
+        };
+        _popup = popup;
+        _engine.Suspended = true; // don't auto-correct what is typed into the search box
+        InputSender.Tap(0xE8);    // counts as "last input", which lets us take the foreground
+        popup.ShowAt(pos);
+    }
+
+    private static Point? CaretPosition(IntPtr hwnd)
+    {
+        var tid = Native.GetWindowThreadProcessId(hwnd, out _);
+        var gti = new Native.GUITHREADINFO { cbSize = System.Runtime.InteropServices.Marshal.SizeOf<Native.GUITHREADINFO>() };
+        if (tid == 0 || !Native.GetGUIThreadInfo(tid, ref gti) || gti.hwndCaret == IntPtr.Zero) return null;
+        var p = new Point(gti.rcCaret.Left, gti.rcCaret.Bottom + 4);
+        return Native.ClientToScreen(gti.hwndCaret, ref p) ? p : null;
     }
 
     private void ToggleExcludeLastApp()
@@ -138,9 +192,9 @@ internal sealed class TrayApp : ApplicationContext
         if (!force && key == _iconKey) return;
         _iconKey = key;
         var old = _icon;
-        _icon = DrawIcon(lang switch { Lang.En => "EN", Lang.Ru => "RU", _ => "··" }, lang, paused);
+        _icon = DrawIcon(lang switch { Lang.En => "EN", Lang.Ru => "RU", Lang.Uk => "UA", _ => "··" }, lang, paused);
         _tray.Icon = _icon;
-        _tray.Text = $"OKBoard — {(lang?.ToString().ToUpperInvariant() ?? "?")}, {StatusText()}";
+        _tray.Text = $"OKBoard — {lang switch { Lang.En => "EN", Lang.Ru => "RU", Lang.Uk => "UA", _ => "?" }}, {StatusText()}";
         if (old != null) { Native.DestroyIcon(old.Handle); old.Dispose(); }
     }
 
@@ -154,6 +208,7 @@ internal sealed class TrayApp : ApplicationContext
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             var bg = paused ? Color.FromArgb(120, 120, 120)
                 : lang == Lang.Ru ? Color.FromArgb(200, 45, 45)
+                : lang == Lang.Uk ? Color.FromArgb(205, 145, 0)
                 : lang == Lang.En ? Color.FromArgb(30, 100, 200)
                 : Color.FromArgb(90, 90, 90);
             using var path = RoundRect(new RectangleF(0, size * 0.12f, size, size * 0.76f), size * 0.18f);
@@ -191,7 +246,7 @@ internal sealed class TrayApp : ApplicationContext
             _settingsForm.Activate();
             return;
         }
-        _settingsForm = new SettingsForm(_settings, _engine);
+        _settingsForm = new SettingsForm(_settings, _engine, ApplyHistorySettings);
         _settingsForm.SelectTab(tab);
         _settingsForm.FormClosed += (_, _) => { _settingsForm = null; UpdateIcon(true); };
         _settingsForm.Show();
@@ -202,6 +257,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         _timer.Stop();
         _engine.Dispose();
+        _history.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         base.ExitThreadCore();

@@ -17,19 +17,28 @@ internal static class Program
 
         var settings = Settings.Load();
         var layouts = new LayoutManager();
-        if (!layouts.HasBoth)
+        if (!layouts.HasLatinAndCyrillic)
         {
-            MessageBox.Show("Для работы нужны установленные раскладки English и Русская.\n" +
+            MessageBox.Show("Для работы нужны раскладка English и хотя бы одна из: Русская, Украинская.\n" +
                             "Добавьте их в Параметры → Время и язык → Язык и регион.",
                 "OKBoard", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
-        var spellRu = SpellChecker.ForLanguage("ru", "ru-RU");
-        var spellEn = SpellChecker.ForLanguage("en", "en-US", "en-GB", "en-AU", "en-IE");
-        // Warm up: the first ISpellChecker call loads the dictionary, which must not happen inside the hook.
-        spellRu.IsCorrect("проверка");
-        spellEn.IsCorrect("check");
-        var detector = new LanguageDetector(spellRu.IsCorrect, spellEn.IsCorrect);
+        // OS spell checkers for the installed languages (Ukrainian may be missing — the detector is stricter then).
+        var spell = new Dictionary<Lang, Func<string, bool?>>();
+        foreach (var (lang, primary, tags) in new[]
+                 {
+                     (Lang.En, "en", new[] { "en-US", "en-GB", "en-AU", "en-IE" }),
+                     (Lang.Ru, "ru", new[] { "ru-RU" }),
+                     (Lang.Uk, "uk", new[] { "uk-UA" }),
+                 })
+        {
+            var checker = SpellChecker.ForLanguage(primary, tags);
+            if (!checker.Available) continue;
+            checker.IsCorrect(lang == Lang.En ? "check" : "привіт"); // warm up: first call loads the dictionary
+            spell[lang] = checker.IsCorrect;
+        }
+        var detector = new LanguageDetector(spell);
         using var engine = new Engine(settings, detector, layouts);
         engine.Start();
 

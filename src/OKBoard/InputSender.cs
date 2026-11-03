@@ -99,30 +99,68 @@ internal static class InputSender
     }
 }
 
-/// <summary>Finds the installed EN/RU layouts and reads/changes the layout of the focused window.</summary>
+/// <summary>Finds the installed EN/RU/UK layouts and reads/changes the layout of the focused window.</summary>
 internal sealed class LayoutManager
 {
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern int ToUnicodeEx(uint vk, uint scan, byte[] state, System.Text.StringBuilder buf, int size, uint flags, IntPtr hkl);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint MapVirtualKeyEx(uint code, uint mapType, IntPtr hkl);
+
     private readonly Dictionary<Lang, IntPtr> _hkl = new();
     private (Lang lang, long tick, IntPtr hwnd)? _pending;
 
+    /// <summary>Supported layouts installed in Windows, in the order of the system language list.</summary>
+    public List<Lang> Installed { get; } = [];
+
     public LayoutManager() => Refresh();
+
+    public static Lang? LangOf(IntPtr hkl) => ((int)((long)hkl & 0xFFFF) & 0x3FF) switch
+    {
+        0x09 => Lang.En,
+        0x19 => Lang.Ru,
+        0x22 => Lang.Uk,
+        _ => null,
+    };
 
     public void Refresh()
     {
         _hkl.Clear();
+        Installed.Clear();
         int n = GetKeyboardLayoutList(0, null);
         var arr = new IntPtr[n];
         GetKeyboardLayoutList(n, arr);
         foreach (var h in arr)
+            if (LangOf(h) is { } l && _hkl.TryAdd(l, h))
+            {
+                Installed.Add(l);
+                LoadKeyMap(l, h);
+            }
+    }
+
+    /// <summary>Read what the installed layout really types for every key we know (layout variants differ).</summary>
+    private static void LoadKeyMap(Lang l, IntPtr hkl)
+    {
+        var state = new byte[256];
+        var buf = new System.Text.StringBuilder(8);
+        foreach (var vk in LayoutMap.Keys.ToList())
         {
-            var lang = (int)((long)h & 0xFFFF);
-            var primary = lang & 0x3FF;
-            if (primary == 0x09) _hkl.TryAdd(Lang.En, h);
-            else if (primary == 0x19) _hkl.TryAdd(Lang.Ru, h);
+            char? Get(bool shift)
+            {
+                Array.Clear(state);
+                if (shift) state[0x10] = 0x80;
+                buf.Clear();
+                // flag 4: don't touch the keyboard state (dead keys) of this thread
+                int r = ToUnicodeEx(vk, MapVirtualKeyEx(vk, 0, hkl), state, buf, buf.Capacity, 4, hkl);
+                return r == 1 && !char.IsControl(buf[0]) ? buf[0] : null;
+            }
+            if (Get(false) is { } normal && Get(true) is { } shifted) LayoutMap.Override(l, vk, normal, shifted);
         }
     }
 
-    public bool HasBoth => _hkl.ContainsKey(Lang.En) && _hkl.ContainsKey(Lang.Ru);
+    public bool Has(Lang l) => _hkl.ContainsKey(l);
+    public bool HasLatinAndCyrillic => Has(Lang.En) && (Has(Lang.Ru) || Has(Lang.Uk));
 
     public static IntPtr FocusWindow(out uint threadId)
     {
@@ -134,15 +172,13 @@ internal sealed class LayoutManager
         return fg;
     }
 
-    /// <summary>Raw primary language of the focused window's layout (null if neither EN nor RU).</summary>
+    /// <summary>Layout of the focused window (null if it isn't one we support).</summary>
     public Lang? Current()
     {
         var hwnd = FocusWindow(out var tid);
         // A layout change we requested may not be applied yet; trust it for a short while.
         if (_pending is { } p && Environment.TickCount64 - p.tick < 400 && p.hwnd == hwnd) return p.lang;
-        var hkl = GetKeyboardLayout(tid);
-        var primary = (int)((long)hkl & 0xFFFF) & 0x3FF;
-        return primary switch { 0x09 => Lang.En, 0x19 => Lang.Ru, _ => null };
+        return LangOf(GetKeyboardLayout(tid));
     }
 
     public void Switch(Lang lang, IntPtr? target = null)

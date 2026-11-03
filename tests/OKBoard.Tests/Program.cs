@@ -1,5 +1,15 @@
 using OKBoard;
 
+if (args.Length == 2 && args[0] == "--ui")
+{
+    int rcUi = 1;
+    var tu = new Thread(() => rcUi = UiShots.Run(args[1]));
+    tu.SetApartmentState(ApartmentState.STA);
+    tu.Start();
+    tu.Join();
+    return rcUi;
+}
+
 if (args.Contains("--e2e"))
 {
     int rc = 1;
@@ -128,9 +138,39 @@ Check("case cycle 3", CaseTools.Cycle("Привет Мир") == "привет м
 Check("caps accident", CaseTools.LooksLikeCapsAccident("пРИВЕТ") && !CaseTools.LooksLikeCapsAccident("Привет"));
 Check("double cap", CaseTools.LooksLikeDoubleCapital("ПРивет") && !CaseTools.LooksLikeDoubleCapital("ПРИВЕТ") && !CaseTools.LooksLikeDoubleCapital("USB"));
 
+// ── Ukrainian ──
+Check("uk render", LayoutMap.Render(Keys("ghbdsn"), Lang.Uk) == "привіт", LayoutMap.Render(Keys("ghbdsn"), Lang.Uk));
+Check("uk ї є", LayoutMap.Render(Keys("]'"), Lang.Uk) == "їє");
+Check("convert en->uk", LayoutMap.ConvertText("ghbdsn", Lang.Uk) == "привіт");
+Check("convert uk->en", LayoutMap.ConvertText("привіт") == "ghbdsn", LayoutMap.ConvertText("привіт"));
+Check("detect uk script", LayoutMap.DetectScript("привіт") == Lang.Uk && LayoutMap.DetectScript("съешь", Lang.Uk) == Lang.Ru
+                          && LayoutMap.DetectScript("привет", Lang.Uk) == Lang.Uk);
+Lang[] all3 = [Lang.En, Lang.Ru, Lang.Uk];
+var dUk = det.AnalyzeBest(Keys("ghbdsn"), Lang.En, all3, Lang.Ru);
+Check("best: привіт → UK", dUk.Convert && dUk.Target == Lang.Uk, $"{dUk.Convert} {dUk.Target} {dUk.Reason}");
+var dRu = det.AnalyzeBest(Keys("ghbdtn"), Lang.En, all3, Lang.Uk);
+Check("best: привет → RU even if UK preferred", dRu.Convert && dRu.Target == Lang.Ru, $"{dRu.Convert} {dRu.Target} {dRu.Reason}");
+var dHerb = det.AnalyzeBest(Keys("herb"), Lang.Uk, all3);   // "руки" typed correctly in UK (no UK dictionary installed)
+Check("uk plausible word not turned into English", !dHerb.Convert, $"{dHerb.Reason} '{dHerb.Current}'→'{dHerb.Alternative}'");
+var dHello = det.AnalyzeBest(Keys("hello"), Lang.Uk, all3); // "руддщ" — garbage in Ukrainian
+Check("garbage in UK → English", dHello.Convert && dHello.Target == Lang.En, $"{dHello.Convert} {dHello.Reason}");
+var dCyr = det.AnalyzeBest(Keys("ghbdsn"), Lang.Ru, [Lang.Ru, Lang.Uk]);
+Check("never auto RU↔UK", !dCyr.Convert, dCyr.Reason);
+Check("uk translit", Transliterator.ToLatin("Щастя Юрій Згорани Їжак", Lang.Uk) == "Shchastia Yurii Zghorany Yizhak",
+    Transliterator.ToLatin("Щастя Юрій Згорани Їжак", Lang.Uk));
+Check("uk translit back", Transliterator.ToCyrillic("pryvit", Lang.Uk) == "привіт", Transliterator.ToCyrillic("pryvit", Lang.Uk));
+Check("translit auto uk", Transliterator.Transliterate("Київ") == "Kyiv", Transliterator.Transliterate("Київ"));
+
+// ── Snippets ──
+var fixedNow = new DateTime(2026, 11, 3, 9, 5, 0);
+Check("snippet expand", Snippets.Expand("Сегодня {date}, {time}", fixedNow) == "Сегодня 03.11.2026, 09:05");
+Check("snippet datetime", Snippets.Expand("{datetime}", fixedNow) == "03.11.2026 09:05");
+
 // ── Hotkey parsing ──
 Check("hotkey parse", Hotkey.Parse("Ctrl+Shift+Pause") == new Hotkey(System.Windows.Forms.Keys.Pause, true, false, true, false));
 Check("hotkey roundtrip", Hotkey.Parse("Ctrl+Alt+T")!.Value.ToString() == "Ctrl+Alt+T");
+Check("unsafe hotkeys", Hotkey.Parse("Q")!.Value.IsSafe == false && Hotkey.Parse("Shift+A")!.Value.IsSafe == false
+                        && Hotkey.Parse("Pause")!.Value.IsSafe && Hotkey.Parse("Ctrl+Alt+V")!.Value.IsSafe);
 
 Console.WriteLine($"{passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;

@@ -29,6 +29,14 @@ internal static class E2E
         Pump(250);
     }
 
+    /// <summary>Pump messages until the condition holds (or the timeout passes).</summary>
+    private static void PumpUntil(Func<bool> done, int ms = 3000)
+    {
+        var end = Environment.TickCount64 + ms;
+        while (Environment.TickCount64 < end && !done()) { Application.DoEvents(); Thread.Sleep(5); }
+        Pump(150);
+    }
+
     private static void Pump(int ms)
     {
         var end = Environment.TickCount64 + ms;
@@ -38,10 +46,16 @@ internal static class E2E
     public static int Run()
     {
         int failed = 0;
+        Form? formRef = null;
         void Expect(string name, string actual, string expected)
         {
             if (actual == expected) Console.WriteLine($"ok   {name}: \"{actual}\"");
-            else { failed++; Console.WriteLine($"FAIL {name}: got \"{actual}\", expected \"{expected}\""); }
+            else
+            {
+                failed++;
+                var fgw = Native.GetForegroundWindow();
+                Console.WriteLine($"FAIL {name}: got \"{actual}\", expected \"{expected}\" (foreground: {(fgw == formRef?.Handle ? "test window" : Native.GetProcessName(fgw))})");
+            }
         }
 
         Engine.Trace = m => Console.WriteLine("  trace: " + m);
@@ -55,6 +69,7 @@ internal static class E2E
         var form = new Form { Text = "OKBoard E2E", Width = 600, Height = 200, TopMost = true, StartPosition = FormStartPosition.CenterScreen };
         var tb = new TextBox { Dock = DockStyle.Fill, Multiline = true, Font = new Font("Segoe UI", 14) };
         form.Controls.Add(tb);
+        formRef = form;
         form.Show();
         SetForegroundWindow(form.Handle);
         form.Activate();
@@ -120,18 +135,19 @@ internal static class E2E
 
         // 8. transliteration of the selection (Ctrl+Alt+T)
         Reset(); tb.Text = "щука"; tb.SelectAll(); Pump(100);
-        Tap(0x54, 0xA2, 0xA4); Pump(800);
+        Tap(0x54, 0xA2, 0xA4); PumpUntil(() => tb.Text != "щука");
         Expect("translit selection", tb.Text, "shchuka");
 
         // 9. selection layout conversion (Shift+Pause)
         Reset(); tb.Text = "Ghbdtn? rfr ltkf&"; tb.SelectAll(); Pump(100);
-        Tap(0x13, 0xA0); Pump(800);
+        Tap(0x13, 0xA0); PumpUntil(() => tb.Text != "Ghbdtn? rfr ltkf&");
         Expect("convert selection", tb.Text, "Привет, как дела?");
 
         // 9b. the user's clipboard survives a selection operation
         Clipboard.SetText("SECRET-CLIPBOARD");
         Reset(); tb.Text = "ntrcn"; tb.SelectAll(); Pump(100);
-        Tap(0x13, 0xA0); Pump(800);
+        Tap(0x13, 0xA0); PumpUntil(() => tb.Text != "ntrcn");
+        PumpUntil(() => Clipboard.GetText() == "SECRET-CLIPBOARD");
         Expect("selection with clipboard", tb.Text, "текст");
         Expect("clipboard restored", Clipboard.GetText(), "SECRET-CLIPBOARD");
 
@@ -151,6 +167,54 @@ internal static class E2E
         Expect("bare-letter hotkey ignored", tb.Text, "q");
         settings.Hotkeys[HotkeyAction.AddException] = "Ctrl+Alt+X";
         engine.ReloadSettings();
+
+        // 9e. Pause twice on the same word cycles back to the original layout
+        Reset(); SetLang(Lang.En);
+        TypeKeys("z");
+        Tap(0x13); Pump(200);
+        Tap(0x13); Pump(200);
+        Expect("Pause cycle returns", tb.Text, "z");
+
+        // 9f. snippets: abbreviation works in any layout, Backspace undoes it
+        settings.Snippets = [new Snippet { Abbr = "мк", Text = "Москва, Кремль" },
+                             new Snippet { Abbr = "подп", Text = "С уважением,\nАлекс" }];
+        engine.ReloadSettings();
+        Reset(); SetLang(Lang.Ru);
+        TypeKeys("vr ");
+        Expect("snippet (RU layout)", tb.Text, "Москва, Кремль ");
+        Reset(); SetLang(Lang.En);
+        TypeKeys("vr ");
+        Expect("snippet typed in EN layout", tb.Text, "Москва, Кремль ");
+        Tap(0x08); Pump(200);
+        Expect("snippet undo", tb.Text, "vr ");
+        Clipboard.SetText("KEEP-ME");
+        Reset(); SetLang(Lang.Ru);
+        TypeKeys("gjlg "); PumpUntil(() => tb.Text.EndsWith("Алекс "));
+        PumpUntil(() => Clipboard.GetText() == "KEEP-ME");
+        Expect("multiline snippet via paste", tb.Text.Replace("\r\n", "\n"), "С уважением,\nАлекс ");
+        Expect("clipboard kept after snippet", Clipboard.GetText(), "KEEP-ME");
+        settings.Snippets = [];
+        engine.ReloadSettings();
+
+        // 9g. clipboard history: records normal copies, skips private ones and our own copy operations
+        using (var history = new ClipboardHistory(engine.IsExcludedApp, () => engine.Busy))
+        {
+            Clipboard.SetText("first copy"); Pump(200);
+            Clipboard.SetText("second copy"); Pump(200);
+            var priv = new DataObject();
+            priv.SetText("my-password-123");
+            priv.SetData("ExcludeClipboardContentFromMonitorProcessing", new MemoryStream(new byte[4]));
+            Clipboard.SetDataObject(priv, true); Pump(200);
+            var noHist = new DataObject();
+            noHist.SetText("no-history-please");
+            noHist.SetData("CanIncludeInClipboardHistory", new MemoryStream(new byte[4]));
+            Clipboard.SetDataObject(noHist, true); Pump(200);
+            Reset(); tb.Text = "ntrcn"; tb.SelectAll(); Pump(100);
+            Tap(0x13, 0xA0); PumpUntil(() => tb.Text != "ntrcn"); Pump(700); // selection conversion copies "ntrcn" internally
+            Clipboard.SetText("first copy"); Pump(200);
+            var texts = history.Items.Select(i => i.Text).ToList();
+            Expect("history order & dedupe", string.Join("|", texts), "first copy|second copy");
+        }
 
         // 10. Caps Lock accident
         Reset(); SetLang(Lang.En);

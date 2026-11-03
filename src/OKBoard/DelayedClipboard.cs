@@ -35,10 +35,35 @@ internal sealed class DelayedClipboard : NativeWindow, IDisposable
     /// <summary>True while the clipboard still holds what we offered (nobody copied anything since).</summary>
     public bool IsOwner => GetClipboardOwner() == Handle;
 
-    /// <summary>Offer text. The returned task completes when some application reads it. Null on failure.</summary>
-    public Task? Offer(string text)
+    /// <summary>
+    /// Offer text. The returned task completes when some application reads it. Null if the clipboard stayed
+    /// locked by another program. Waits asynchronously: this runs on the thread that also serves the keyboard hook.
+    /// </summary>
+    public async Task<Task?> OfferAsync(string text)
     {
-        if (!Open()) return null;
+        for (int i = 0; i < 20 && !OpenClipboard(Handle); i++)
+        {
+            if (i == 19) return null;
+            await Task.Delay(25);
+        }
+        return OfferOpened(text);
+    }
+
+    /// <summary>
+    /// Wait (asynchronously) until no other program holds the clipboard, so that the synchronous WinForms
+    /// clipboard calls that follow don't block the hook thread with their own sleep-and-retry loops.
+    /// </summary>
+    public async Task WaitAvailableAsync(int timeoutMs = 500)
+    {
+        for (int waited = 0; waited < timeoutMs; waited += 25)
+        {
+            if (OpenClipboard(Handle)) { CloseClipboard(); return; }
+            await Task.Delay(25);
+        }
+    }
+
+    private Task? OfferOpened(string text)
+    {
         try
         {
             if (!EmptyClipboard()) return null;
@@ -50,16 +75,6 @@ internal sealed class DelayedClipboard : NativeWindow, IDisposable
             return _requested.Task;
         }
         finally { CloseClipboard(); }
-    }
-
-    private bool Open()
-    {
-        for (int i = 0; i < 10; i++)
-        {
-            if (OpenClipboard(Handle)) return true;
-            Thread.Sleep(15);
-        }
-        return false;
     }
 
     private static IntPtr Alloc(byte[] bytes)

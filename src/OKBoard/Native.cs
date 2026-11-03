@@ -138,6 +138,12 @@ internal static class Native
     public static extern int GetKeyboardLayoutList(int nBuff, [Out] IntPtr[]? lpList);
 
     [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ClientToScreen(IntPtr hWnd, ref System.Drawing.Point point);
+
+    [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll")]
