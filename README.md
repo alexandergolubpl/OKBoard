@@ -47,6 +47,15 @@
 - Значок в трее показывает текущую раскладку (EN — синий, RU — красный, серый с чертой — пауза).
 - Автозапуск, один экземпляр, «сторож», который переустанавливает перехват клавиатуры, если Windows его сняла.
 
+## Установка
+
+Скачайте `OKBoard-Setup-x.y.z.exe` со страницы [Releases](https://github.com/alexandergolubpl/OKBoard/releases)
+и запустите. Права администратора не нужны, .NET устанавливать не нужно. Есть и переносная версия
+(`OKBoard-x.y.z-portable.exe`) — просто запустите её.
+
+Файлы не подписаны цифровой подписью, поэтому Windows SmartScreen может показать предупреждение:
+«Подробнее» → «Выполнить в любом случае».
+
 ## Сборка и запуск
 
 Нужен .NET 10 SDK.
@@ -59,6 +68,12 @@ dotnet run --project src/OKBoard
 dotnet publish src/OKBoard -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
 # полностью автономный exe (~150 МБ, ничего ставить не нужно):
 dotnet publish src/OKBoard -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
+```
+
+Установщик и переносная версия (нужен [Inno Setup 6](https://jrsoftware.org/isinfo.php)):
+
+```powershell
+.\installer\build.ps1 -Version 0.1.0   # результат в .\dist
 ```
 
 Тесты:

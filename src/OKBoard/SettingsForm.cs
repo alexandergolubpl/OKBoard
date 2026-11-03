@@ -37,6 +37,7 @@ internal sealed class SettingsForm : Form
         MinimumSize = new Size(620, 460);
         StartPosition = FormStartPosition.CenterScreen;
         ShowInTaskbar = true;
+        try { Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!); } catch { }
 
         _tabs.TabPages.Add(GeneralTab());
         _tabs.TabPages.Add(HotkeysTab());

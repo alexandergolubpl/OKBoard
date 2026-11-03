@@ -5,3 +5,4 @@ publish/
 .vscode/
 *.user
 *.suo
+dist/

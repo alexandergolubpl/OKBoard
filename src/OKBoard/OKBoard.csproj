@@ -10,6 +10,11 @@
     <AssemblyName>OKBoard</AssemblyName>
     <RootNamespace>OKBoard</RootNamespace>
     <Version>0.1.0</Version>
+    <ApplicationIcon>OKBoard.ico</ApplicationIcon>
+    <Product>OKBoard</Product>
+    <Description>Smart RU/EN keyboard layout switcher</Description>
+    <Authors>AlexG</Authors>
+    <Copyright>Copyright (c) 2026 AlexG</Copyright>
     <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
   </PropertyGroup>
   <ItemGroup>
