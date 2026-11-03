@@ -111,3 +111,7 @@ src/OKBoard/
   SettingsForm.cs      окно настроек
 tests/OKBoard.Tests/   юнит-тесты и E2E
 ```
+
+## Лицензия
+
+[MIT](LICENSE)
