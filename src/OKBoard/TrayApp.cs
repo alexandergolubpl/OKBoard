@@ -192,7 +192,7 @@ internal sealed class TrayApp : ApplicationContext
         if (!force && key == _iconKey) return;
         _iconKey = key;
         var old = _icon;
-        _icon = DrawIcon(lang switch { Lang.En => "EN", Lang.Ru => "RU", Lang.Uk => "UA", _ => "··" }, lang, paused);
+        _icon = DrawIcon(lang switch { Lang.En => "EN", Lang.Ru => "RU", Lang.Uk => "UA", _ => "?" }, lang, paused);
         _tray.Icon = _icon;
         _tray.Text = $"OKBoard — {lang switch { Lang.En => "EN", Lang.Ru => "RU", Lang.Uk => "UA", _ => "?" }}, {StatusText()}";
         if (old != null) { Native.DestroyIcon(old.Handle); old.Dispose(); }
@@ -200,30 +200,60 @@ internal sealed class TrayApp : ApplicationContext
 
     private static Icon DrawIcon(string text, Lang? lang, bool paused)
     {
-        int size = SystemInformation.SmallIconSize.Width >= 24 ? 32 : 16;
-        using var bmp = new Bitmap(size, size);
-        using (var g = Graphics.FromImage(bmp))
-        {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-            var bg = paused ? Color.FromArgb(120, 120, 120)
-                : lang == Lang.Ru ? Color.FromArgb(200, 45, 45)
-                : lang == Lang.Uk ? Color.FromArgb(205, 145, 0)
-                : lang == Lang.En ? Color.FromArgb(30, 100, 200)
-                : Color.FromArgb(90, 90, 90);
-            using var path = RoundRect(new RectangleF(0, size * 0.12f, size, size * 0.76f), size * 0.18f);
-            using var brush = new SolidBrush(bg);
-            g.FillPath(brush, path);
-            using var font = new Font("Segoe UI", size * 0.42f, FontStyle.Bold, GraphicsUnit.Pixel);
-            var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-            g.DrawString(text, font, Brushes.White, new RectangleF(0, 0, size, size + 1), fmt);
-            if (paused)
-            {
-                using var pen = new Pen(Color.FromArgb(255, 210, 60), size / 10f);
-                g.DrawLine(pen, size * 0.08f, size * 0.85f, size * 0.92f, size * 0.15f);
-            }
-        }
+        // Render at the exact tray size (16/20/24/32 px depending on DPI) so the letters stay crisp.
+        int size = Math.Clamp(SystemInformation.SmallIconSize.Width, 16, 64);
+        using var bmp = RenderIcon(text, lang, paused, size);
         return Icon.FromHandle(bmp.GetHicon());
+    }
+
+    private static readonly string IconFont = PickIconFont();
+
+    private static string PickIconFont()
+    {
+        using var fonts = new System.Drawing.Text.InstalledFontCollection();
+        foreach (var name in new[] { "Bahnschrift SemiBold SemiConden", "Bahnschrift SemiBold Condensed", "Bahnschrift", "Segoe UI Black" })
+            if (fonts.Families.Any(f => f.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) return name;
+        return "Segoe UI";
+    }
+
+    /// <summary>Full-size rounded square with the layout code as large as fits inside it.</summary>
+    internal static Bitmap RenderIcon(string text, Lang? lang, bool paused, int size)
+    {
+        var bmp = new Bitmap(size, size);
+        using var g = Graphics.FromImage(bmp);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        var bg = paused ? Color.FromArgb(110, 110, 110)
+            : lang == Lang.Ru ? Color.FromArgb(200, 40, 40)
+            : lang == Lang.Uk ? Color.FromArgb(200, 140, 0)
+            : lang == Lang.En ? Color.FromArgb(25, 95, 200)
+            : Color.FromArgb(90, 90, 90);
+        using var shape = RoundRect(new RectangleF(0, 0, size, size), size * 0.22f);
+        using (var brush = new SolidBrush(bg))
+            g.FillPath(brush, shape);
+        g.SetClip(shape);
+
+        // Letters as a path, scaled to fill the box (glyph bounds, not font line height).
+        using var glyphs = new GraphicsPath();
+        using (var family = new FontFamily(IconFont))
+            glyphs.AddString(text, family, (int)FontStyle.Bold, 100, PointF.Empty, StringFormat.GenericTypographic);
+        var b = glyphs.GetBounds();
+        float boxW = size * 0.88f, boxH = size * 0.60f;
+        float scale = Math.Min(boxW / b.Width, boxH / b.Height);
+        using var m = new Matrix();
+        m.Translate(size / 2f, size / 2f);
+        m.Scale(scale, scale);
+        m.Translate(-(b.X + b.Width / 2f), -(b.Y + b.Height / 2f));
+        glyphs.Transform(m);
+        g.FillPath(Brushes.White, glyphs);
+
+        if (paused) // small yellow "pause" corner instead of a slash across the letters
+        {
+            using var mark = new SolidBrush(Color.FromArgb(255, 205, 50));
+            float r = size * 0.30f;
+            g.FillPolygon(mark, [new PointF(size - r, 0), new PointF(size, 0), new PointF(size, r)]);
+        }
+        return bmp;
     }
 
     private static GraphicsPath RoundRect(RectangleF r, float radius)

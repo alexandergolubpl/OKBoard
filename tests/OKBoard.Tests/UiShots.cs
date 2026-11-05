@@ -28,6 +28,22 @@ internal static class UiShots
         popup.Show();
         Application.DoEvents();
         Save(popup, Path.Combine(dir, "popup.png"));
+        foreach (int sz in new[] { 16, 20, 24, 32 })
+        {
+            using var sheet = new Bitmap(sz * 5 + 40, sz + 8);
+            using (var sg = Graphics.FromImage(sheet))
+            {
+                sg.Clear(Color.FromArgb(32, 32, 32));
+                int x = 4;
+                foreach (var (t, l, p) in new (string, Lang?, bool)[] { ("EN", Lang.En, false), ("RU", Lang.Ru, false), ("UA", Lang.Uk, false), ("EN", Lang.En, true), ("?", null, false) })
+                {
+                    using var ic = TrayApp.RenderIcon(t, l, p, sz);
+                    sg.DrawImageUnscaled(ic, x, 4);
+                    x += sz + 8;
+                }
+            }
+            sheet.Save(Path.Combine(dir, $"icons-{sz}.png"));
+        }
         popup.Close();
 
         var form = new SettingsForm(settings, engine, () => { });
