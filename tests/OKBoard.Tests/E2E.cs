@@ -216,6 +216,17 @@ internal static class E2E
             Expect("history order & dedupe", string.Join("|", texts), "first copy|second copy");
         }
 
+        // 9h. a Shift release the engine never saw (stuck modifier) must not turn the next word into capitals
+        Reset(); SetLang(Lang.En);
+        Key(0xA0, false);
+        SendInput(1, [new Native.INPUT { type = 1, U = new Native.InputUnion { ki = new Native.KEYBDINPUT { wVk = 0xA0, dwFlags = 2, dwExtraInfo = (IntPtr)0x4F4B4244 } } }], Marshal.SizeOf<Native.INPUT>());
+        Pump(60);
+        TypeKeys("ghbdtn ");
+        Expect("stuck Shift ignored", tb.Text, "привет ");
+        Reset(); SetLang(Lang.En);
+        TypeKeys("Ghbdtn ");
+        Expect("capitalised word keeps its case", tb.Text, "Привет ");
+
         // 10. Caps Lock accident
         Reset(); SetLang(Lang.En);
         Tap(0x14);

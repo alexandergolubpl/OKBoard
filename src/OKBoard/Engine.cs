@@ -25,7 +25,7 @@ internal sealed class Engine : IDisposable
 
     private readonly List<KeyStroke> _line = [];
     private readonly HashSet<ushort> _held = [];
-    private bool _caps, _capsKeyDown, _swallowCapsUp;
+    private bool _capsKeyDown, _swallowCapsUp;
     private bool _shiftDown, _shiftAlone;
     private long _lastShiftTap;
     private Lang? _wordStartLang;
@@ -82,7 +82,6 @@ internal sealed class Engine : IDisposable
         _kbProc = KeyboardProc;
         _mouseProc = MouseProc;
         _fgProc = ForegroundProc;
-        _caps = (GetKeyState(VK_CAPITAL) & 1) != 0;
         ReloadSettings();
     }
 
@@ -199,11 +198,7 @@ internal sealed class Engine : IDisposable
             var k = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
             int msg = (int)wParam;
             bool down = msg is WM_KEYDOWN or WM_SYSKEYDOWN;
-            if (k.dwExtraInfo == InjectMarker)
-            {
-                if (k.vkCode == VK_CAPITAL && down) _caps = !_caps;
-            }
-            else
+            if (k.dwExtraInfo != InjectMarker)
             {
                 try
                 {
@@ -244,6 +239,24 @@ internal sealed class Engine : IDisposable
     }
 
     private static bool IsModifier(ushort vk) => vk is 0x10 or 0x11 or 0x12 or >= 0xA0 and <= 0xA5 or 0x5B or 0x5C;
+    /// <summary>
+    /// Real Caps Lock state. Counting CapsLock presses drifts: "Shift turns off Caps Lock" (Windows setting),
+    /// other keyboard tools, the lock screen and dropped hook events all change it without us seeing a press.
+    /// GetKeyState inside the low-level hook reflects the system toggle state (verified).
+    /// </summary>
+    private static bool CapsOn => (GetKeyState(VK_CAPITAL) & 1) != 0;
+
+    /// <summary>
+    /// Drop modifiers we think are held but the system says are up — a missed key-up (Win+Shift+S, lock screen,
+    /// UAC prompt, our own injected release) would otherwise make every following letter look shifted, or make
+    /// every key look like a Ctrl-shortcut and silently stop auto-correction.
+    /// </summary>
+    private void SyncModifiers()
+    {
+        if (_held.Count == 0) return;
+        _held.RemoveWhere(vk => (GetAsyncKeyState(vk) & 0x8000) == 0);
+    }
+
     private bool ShiftHeld => _held.Contains(0xA0) || _held.Contains(0xA1) || _held.Contains(0x10);
     private bool CtrlHeld => _held.Contains(0xA2) || _held.Contains(0xA3) || _held.Contains(0x11);
     private bool AltHeld => _held.Contains(0xA4) || _held.Contains(0xA5) || _held.Contains(0x12);
@@ -271,6 +284,7 @@ internal sealed class Engine : IDisposable
 
         _shiftAlone = false;
         _lastShiftTap = 0;
+        SyncModifiers();
 
         if (vk == VK_CAPITAL)
         {
@@ -282,7 +296,6 @@ internal sealed class Engine : IDisposable
                 _swallowCapsUp = true;
                 return true;
             }
-            if (first) _caps = !_caps;
             return false;
         }
 
@@ -332,7 +345,7 @@ internal sealed class Engine : IDisposable
                 _wordStartLang = _layouts.Current();
                 if (_wordStartLang is { } l && LayoutMap.IsCyrillicLang(l)) _lastCyrillic = l;
             }
-            _line.Add(new KeyStroke(vk, ShiftHeld, _caps));
+            _line.Add(new KeyStroke(vk, ShiftHeld, CapsOn));
             if (_line.Count > 400) _line.RemoveRange(0, 200);
             return false;
         }
@@ -451,7 +464,7 @@ internal sealed class Engine : IDisposable
             }
             var text = LayoutMap.Render(newKeys, renderLang);
             bool capsOff = false;
-            if (_s.FixCapsLockAccident && _caps && CaseTools.LooksLikeCapsAccident(text))
+            if (_s.FixCapsLockAccident && CapsOn && word.All(k => k.Caps) && CaseTools.LooksLikeCapsAccident(text))
             {
                 // flip the case of letters only — punctuation keys must stay as they are
                 newKeys = newKeys.Select(k => LayoutMap.CharFor(k, renderLang) is { } c && char.IsLetter(c)
