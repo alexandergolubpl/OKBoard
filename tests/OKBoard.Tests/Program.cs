@@ -2,12 +2,29 @@ using OKBoard;
 
 if (args.Length == 2 && args[0] == "--ui")
 {
+    Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
     int rcUi = 1;
     var tu = new Thread(() => rcUi = UiShots.Run(args[1]));
     tu.SetApartmentState(ApartmentState.STA);
     tu.Start();
     tu.Join();
     return rcUi;
+}
+
+if (args.Contains("--update-live"))
+{
+    // Real GitHub: latest release → pick the installer → download → SHA-256 check. Installs nothing.
+    using var http = new System.Net.Http.HttpClient();
+    http.DefaultRequestHeaders.UserAgent.ParseAdd("OKBoard-Updater/test");
+    var json = await http.GetStringAsync($"https://api.github.com/repos/{Updater.Repo}/releases/latest");
+    var info = Updater.Pick(json, new Version(0, 0, 1));
+    Console.WriteLine(info == null ? "no usable release" : $"picked {info.AssetName} {info.Size} bytes sha256 {info.Sha256}");
+    if (info == null) return 1;
+    using var up = new Updater(new Settings());
+    var path = await up.DownloadAsync(info);
+    Console.WriteLine($"downloaded and verified: {path} ({new FileInfo(path).Length} bytes)");
+    File.Delete(path);
+    return 0;
 }
 
 if (args.Contains("--e2e"))
@@ -165,6 +182,87 @@ Check("translit auto uk", Transliterator.Transliterate("Київ") == "Kyiv", Tr
 var fixedNow = new DateTime(2026, 11, 3, 9, 5, 0);
 Check("snippet expand", Snippets.Expand("Сегодня {date}, {time}", fixedNow) == "Сегодня 03.11.2026, 09:05");
 Check("snippet datetime", Snippets.Expand("{datetime}", fixedNow) == "03.11.2026 09:05");
+
+// ── Editor / IDE / Unity tokens typed in the right layout must never be "corrected" ──
+{
+    Lang[] enRu = [Lang.En, Lang.Ru];
+    // What the user typed with the EN layout active (US key positions).
+    string[] enTokens =
+    [
+        // Unity search filters & paths
+        "t:Prefab", "t:Material", "t:Scene", "t:Texture2D", "t:prefab", "l:Environment", "ref:Player", "t:AnimationClip",
+        "Assets/Prefabs", "Packages/", "Editor/", "h:Player",
+        // Unity / C# API
+        "GameObject", "MonoBehaviour", "OnTriggerEnter", "deltaTime", "transform.position", "rb.velocity", "Debug.Log",
+        "[SerializeField]", "Vector3.zero", "Quaternion.identity", "Mathf.Clamp", "GetComponent<Rigidbody>()", "Time.deltaTime",
+        "Awake", "Update", "FixedUpdate", "Rigidbody", "Collider", "prefab", "prefabs", "shader", "mesh", "navmesh", "lerp",
+        "slerp", "raycast", "gizmo", "gizmos", "asmdef", "csproj", "playmode", "inspector", "hierarchy", "spritesheet",
+        // code keywords & common identifiers
+        "var", "int", "bool", "float", "void", "enum", "struct", "foreach", "namespace", "using", "typeof", "nameof",
+        "async", "await", "ctx", "cfg", "args", "impl", "init", "src", "dst", "tmp", "idx", "len", "str", "obj", "btn", "img",
+        "std::vector", "i++", "x=5;", "a.b", "#if", "#endif", "e.g.", "i.e.", "etc.", "obj.name", "this.gameObject",
+        // shell & tools
+        "git", "npm", "cd", "ls", "mkdir", "sudo", "chmod", "grep", "json", "yaml", "http", "localhost", "dotnet", "nuget",
+        "github", "okboard", "todo", "fixme", "wip", "lol", "btw", "ok", "pls", "thx",
+        // hotkey-ish sequences that land in the buffer when an editor uses bare letters (Unity scene view: Q W E R T Y)
+        "qwerty", "wasd", "qwe", "asdf", "zxc",
+    ];
+    foreach (var t in enTokens)
+    {
+        var d = det.AnalyzeBest(Keys(t), Lang.En, enRu);
+        Check($"EN token kept: {t}", !d.Convert, $"→ '{d.Alternative}' ({d.Reason})");
+    }
+    // Russian words (including IT slang) typed correctly with the RU layout active. Given as US key positions.
+    (string keys, string word)[] ruTokens =
+    [
+        ("rjvvbn", "коммит"), ("gei", "пуш"), (",bkl", "билд"), ("ghtaf,", "префаб"), ("lt,fuftv", "дебагаем"), ("rjvgjytyn", "компонент"),
+        ("he,bv", "рубим"), ("bltv", "идем"), ("cltkfnm", "сделать"), ("ckjdj", "слово"), ("ytn", "нет"), ("lf", "да"),
+    ];
+    foreach (var (k, w) in ruTokens)
+    {
+        var d = det.AnalyzeBest(Keys(k), Lang.Ru, enRu);
+        Check($"RU word kept: {w}", !d.Convert, $"'{d.Current}' → '{d.Alternative}' ({d.Reason})");
+    }
+    // ...while real wrong-layout typing is still fixed, including words with б ю ж х э ъ (punctuation keys)
+    (string keys, Lang cur, string expect)[] fix =
+    [
+        ("ghbdtn", Lang.En, "привет"), ("j,sxyj", Lang.En, "обычно"), ("k.,jdm", Lang.En, "любовь"), (";bpym", Lang.En, "жизнь"),
+        ("[jhjij", Lang.En, "хорошо"), ("'nj", Lang.En, "это"), ("cgfcb,j", Lang.En, "спасибо"), ("Ghbdtn", Lang.En, "Привет"),
+        ("ntcn", Lang.En, "тест"), ("ghjtrn", Lang.En, "проект"),
+        ("hello", Lang.Ru, "hello"), ("world", Lang.Ru, "world"), ("prefab", Lang.Ru, "prefab"), ("update", Lang.Ru, "update"),
+    ];
+    foreach (var (k, cur, expect) in fix)
+    {
+        var d = det.AnalyzeBest(Keys(k), cur, enRu);
+        Check($"still fixed: {expect}", d.Convert && d.Alternative == expect, $"{d.Convert} '{d.Alternative}' ({d.Reason})");
+    }
+}
+
+// ── Updater: parsing GitHub's "latest release" ──
+{
+    const string sha = "2225818078a436018df28adf342844d2cc18dc439f3e58ecaf38793b616e5b6b";
+    string Rel(string tag, string asset, string url, string? digest = "sha256:" + sha, bool pre = false, long size = 46649249)
+    {
+        string Q(string x) => "\"" + x + "\"";
+        var other = "{" + $"{Q("name")}:{Q("OKBoard-0.9.0-portable.exe")},{Q("browser_download_url")}:{Q($"https://github.com/{Updater.Repo}/releases/download/{tag}/x.exe")},{Q("size")}:1,{Q("digest")}:{Q("sha256:" + sha)}" + "}";
+        var main = "{" + $"{Q("name")}:{Q(asset)},{Q("browser_download_url")}:{Q(url)},{Q("size")}:{size}" + (digest == null ? "" : $",{Q("digest")}:{Q(digest)}") + "}";
+        return "{" + $"{Q("tag_name")}:{Q(tag)},{Q("draft")}:false,{Q("prerelease")}:{(pre ? "true" : "false")},{Q("html_url")}:{Q("https://github.com/" + Updater.Repo + "/releases/tag/" + tag)},{Q("assets")}:[{other},{main}]" + "}";
+    }
+    var good = $"https://github.com/{Updater.Repo}/releases/download/v0.9.0/OKBoard-Setup-0.9.0.exe";
+    var cur = new Version(0, 2, 3);
+    var u = Updater.Pick(Rel("v0.9.0", "OKBoard-Setup-0.9.0.exe", good), cur);
+    Check("update: newer release found", u != null && u.Version == new Version(0, 9, 0) && u.Sha256 == sha && u.Download.ToString() == good, u?.ToString() ?? "null");
+    Check("update: same version ignored", Updater.Pick(Rel("v0.2.3", "OKBoard-Setup-0.2.3.exe", good), cur) == null);
+    Check("update: older ignored", Updater.Pick(Rel("v0.1.0", "OKBoard-Setup-0.1.0.exe", good), cur) == null);
+    Check("update: prerelease ignored", Updater.Pick(Rel("v0.9.0", "OKBoard-Setup-0.9.0.exe", good, pre: true), cur) == null);
+    Check("update: no digest → not installed", Updater.Pick(Rel("v0.9.0", "OKBoard-Setup-0.9.0.exe", good, digest: null), cur) == null);
+    Check("update: foreign host rejected", Updater.Pick(Rel("v0.9.0", "OKBoard-Setup-0.9.0.exe", "https://evil.example/OKBoard-Setup-0.9.0.exe"), cur) == null);
+    Check("update: other repo rejected", Updater.Pick(Rel("v0.9.0", "OKBoard-Setup-0.9.0.exe", "https://github.com/someone/else/releases/download/v0.9.0/OKBoard-Setup-0.9.0.exe"), cur) == null);
+    Check("update: http rejected", Updater.Pick(Rel("v0.9.0", "OKBoard-Setup-0.9.0.exe", good.Replace("https:", "http:")), cur) == null);
+    Check("update: oversized rejected", Updater.Pick(Rel("v0.9.0", "OKBoard-Setup-0.9.0.exe", good, size: 500L * 1024 * 1024), cur) == null);
+    Check("update: wrong asset name ignored", Updater.Pick(Rel("v0.9.0", "OKBoard-Setup-0.8.0.exe", good), cur) == null);
+    Check("update: garbage tag ignored", Updater.Pick(Rel("latest", "OKBoard-Setup-0.9.0.exe", good), cur) == null);
+}
 
 // ── Hotkey parsing ──
 Check("hotkey parse", Hotkey.Parse("Ctrl+Shift+Pause") == new Hotkey(System.Windows.Forms.Keys.Pause, true, false, true, false));

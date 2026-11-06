@@ -38,6 +38,13 @@ public static class Snippets
 public sealed class Settings
 {
     public bool AutoSwitch { get; set; } = true;
+    /// <summary>Check GitHub for new releases and install them (installed copies only).</summary>
+    public bool AutoUpdate { get; set; } = true;
+    public DateTime LastUpdateCheckUtc { get; set; }
+    /// <summary>Version that ran last time: shows "updated to X" once after an update.</summary>
+    public string LastRunVersion { get; set; } = "";
+    /// <summary>"system", "light" or "dark".</summary>
+    public string Theme { get; set; } = "system";
     public bool FixCapsLockAccident { get; set; } = true;
     public bool FixDoubleCapital { get; set; } = true;
     public bool DoubleShiftConverts { get; set; } = true;

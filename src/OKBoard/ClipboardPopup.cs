@@ -5,16 +5,16 @@ internal sealed class ClipboardPopup : Form
 {
     private readonly ClipboardHistory _history;
     private readonly Action<string> _onPick;
-    private readonly TextBox _search = new() { Dock = DockStyle.Top, BorderStyle = BorderStyle.FixedSingle, PlaceholderText = "Поиск…" };
+    private readonly TextBox _search = new() { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, PlaceholderText = "Поиск…" };
     private readonly ListBox _list = new()
     {
         Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, DrawMode = DrawMode.OwnerDrawFixed,
-        IntegralHeight = false, HorizontalScrollbar = false,
+        IntegralHeight = false, HorizontalScrollbar = false, Tag = "keep",
     };
     private readonly Label _hint = new()
     {
-        Dock = DockStyle.Bottom, AutoSize = false, Height = 22, TextAlign = ContentAlignment.MiddleLeft,
-        ForeColor = SystemColors.GrayText, Text = "  Enter — вставить · Ctrl+1…9 · Del — удалить · Esc",
+        Dock = DockStyle.Bottom, AutoSize = false, Height = 28, TextAlign = ContentAlignment.MiddleLeft, Tag = "hint",
+        Text = "  Enter — вставить · Ctrl+1…9 · Del — удалить · Esc",
     };
     private bool _picked;
 
@@ -23,20 +23,30 @@ internal sealed class ClipboardPopup : Form
         _history = history;
         _onPick = onPick;
         Text = "OKBoard — буфер обмена";
-        FormBorderStyle = FormBorderStyle.FixedToolWindow;
-        ControlBox = false;
+        FormBorderStyle = FormBorderStyle.None;
+        Padding = new Padding(1);
         ShowInTaskbar = false;
         TopMost = true;
         StartPosition = FormStartPosition.Manual;
         KeyPreview = true;
-        Font = new Font("Segoe UI", 9.5f);
+        SuspendLayout();
+        AutoScaleDimensions = new SizeF(96F, 96F);
         AutoScaleMode = AutoScaleMode.Dpi;
+        Font = new Font("Segoe UI", 9.5f);
         ClientSize = new Size(480, 360);
-        _list.ItemHeight = (int)(Font.Height * 1.6);
+        _list.ItemHeight = (int)(Font.Height * 1.9);
 
-        Controls.Add(_list);
-        Controls.Add(_search);
+        var top = new Panel { Dock = DockStyle.Top, Height = _search.PreferredHeight + 20, Padding = new Padding(10, 10, 10, 10) };
+        top.Controls.Add(_search);
+        var listHost = new Panel { Dock = DockStyle.Fill, Padding = new Padding(6, 0, 6, 0) };
+        listHost.Controls.Add(_list);
+        Controls.Add(listHost);
+        Controls.Add(top);
         Controls.Add(_hint);
+        ResumeLayout(true);
+        Theme.Apply(this);
+        _list.BackColor = Theme.P.Window;
+        _list.ForeColor = Theme.P.Text;
 
         _search.TextChanged += (_, _) => Refill();
         _list.DrawItem += DrawItem;
@@ -71,10 +81,21 @@ internal sealed class ClipboardPopup : Form
     private void DrawItem(object? sender, DrawItemEventArgs e)
     {
         if (e.Index < 0 || _list.Items[e.Index] is not ClipboardHistory.Item item) return;
-        e.DrawBackground();
+        var pal = Theme.P;
         bool sel = (e.State & DrawItemState.Selected) != 0;
-        var fg = sel ? SystemColors.HighlightText : SystemColors.ControlText;
-        var gray = sel ? SystemColors.HighlightText : SystemColors.GrayText;
+        using (var bg = new SolidBrush(pal.Window)) e.Graphics.FillRectangle(bg, e.Bounds);
+        if (sel)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var path = Theme.RoundRect(new RectangleF(e.Bounds.X + 1, e.Bounds.Y + 1, e.Bounds.Width - 2, e.Bounds.Height - 2), 5);
+            using var hb = new SolidBrush(pal.Hover);
+            e.Graphics.FillPath(hb, path);
+            using var bar = Theme.RoundRect(new RectangleF(e.Bounds.X + 2, e.Bounds.Y + e.Bounds.Height / 2f - 8, 3, 16), 1.5f);
+            using var ab = new SolidBrush(pal.Accent);
+            e.Graphics.FillPath(ab, bar);
+        }
+        var fg = pal.Text;
+        var gray = pal.SubText;
 
         var num = e.Index < 9 ? $"{e.Index + 1}" : "";
         var oneLine = item.Text.Replace("\r\n", " ⏎ ").Replace('\n', ' ').Replace('\t', ' ').Trim();
@@ -84,7 +105,7 @@ internal sealed class ClipboardPopup : Form
         var r = e.Bounds;
         int numW = (int)(Font.Height * 1.3), timeW = (int)(Font.Height * 3.2);
         var flags = TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
-        TextRenderer.DrawText(e.Graphics, num, Font, new Rectangle(r.X + 4, r.Y, numW, r.Height), gray, flags);
+        TextRenderer.DrawText(e.Graphics, num, Font, new Rectangle(r.X + 8, r.Y, numW, r.Height), sel ? pal.Accent : gray, flags);
         TextRenderer.DrawText(e.Graphics, oneLine, Font, new Rectangle(r.X + 4 + numW, r.Y, r.Width - numW - timeW - 8, r.Height), fg,
             flags | TextFormatFlags.EndEllipsis);
         TextRenderer.DrawText(e.Graphics, time, Font, new Rectangle(r.Right - timeW, r.Y, timeW - 4, r.Height), gray,
@@ -149,4 +170,27 @@ internal sealed class ClipboardPopup : Form
     }
 
     public bool WasPicked => _picked;
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Theme.ApplyChrome(Handle, round: true, border: true);
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ClassStyle |= 0x00020000; // CS_DROPSHADOW
+            return cp;
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        using var pen = new Pen(Theme.P.Border); // Windows 10 has no DWM border colour
+        e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+    }
 }

@@ -8,25 +8,81 @@ internal static class E2E
     [DllImport("user32.dll")] private static extern IntPtr ActivateKeyboardLayout(IntPtr hkl, uint flags);
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr h);
 
-    private static void Key(ushort vk, bool up, bool ext = false) =>
-        SendInput(1, [new Native.INPUT { type = 1, U = new Native.InputUnion { ki = new Native.KEYBDINPUT { wVk = vk, dwFlags = (up ? 2u : 0) | (ext ? 1u : 0) } } }], Marshal.SizeOf<Native.INPUT>());
+    private sealed class FocusLostException(string where) : Exception(where);
+
+    /// <summary>
+    /// Windows our synthetic input may go to. Input is injected globally, so if the user clicks another app
+    /// while the test runs, keys would land there (a chat, an editor...). Abort instead.
+    /// </summary>
+    private static readonly HashSet<IntPtr> AllowedForeground = [];
+
+    private static void EnsureForeground()
+    {
+        if (AllowedForeground.Count == 0) return;
+        for (int i = 0; i < 30 && !AllowedForeground.Contains(Native.GetForegroundWindow()); i++)
+        {
+            Application.DoEvents();
+            Thread.Sleep(10);
+        }
+        var fg = Native.GetForegroundWindow();
+        if (!AllowedForeground.Contains(fg)) throw new FocusLostException(Native.GetProcessName(fg) ?? "?");
+    }
+
+    private static void SendKey(ushort vk, bool up, bool ext = false, bool marked = false) =>
+        SendInput(1, [new Native.INPUT { type = 1, U = new Native.InputUnion { ki = new Native.KEYBDINPUT
+        {
+            wVk = vk, dwFlags = (up ? 2u : 0) | (ext ? 1u : 0), dwExtraInfo = marked ? (IntPtr)0x4F4B4244 : IntPtr.Zero,
+        } } }], Marshal.SizeOf<Native.INPUT>());
+
+    private static void Key(ushort vk, bool up, bool ext = false)
+    {
+        if (!up) EnsureForeground();
+        SendKey(vk, up, ext);
+    }
+
+    private static bool IsExtended(ushort vk) => vk is >= 0x21 and <= 0x28 or 0x2D or 0x2E or 0xA3 or 0xA5;
 
     private static void Tap(ushort vk, params ushort[] mods)
     {
-        foreach (var m in mods) Key(m, false);
-        Key(vk, false, vk == 0x13 ? false : false); Key(vk, true);
-        foreach (var m in mods.Reverse()) Key(m, true);
+        foreach (var m in mods) Key(m, false, IsExtended(m));
+        Key(vk, false, IsExtended(vk)); Key(vk, true, IsExtended(vk));
+        foreach (var m in mods.Reverse()) Key(m, true, IsExtended(m));
         Pump(60);
     }
 
-    private static void TypeKeys(string usKeys)
+    private const string UsLower = "qwertyuiop[]asdfghjkl;'zxcvbnm,./`1234567890-=\\ ";
+    private const string UsUpper = "QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?~!@#$%^&*()_+| ";
+    private static readonly ushort[] UsVk =
+    [
+        .. "QWERTYUIOP".Select(c => (ushort)c), 0xDB, 0xDD, .. "ASDFGHJKL".Select(c => (ushort)c), 0xBA, 0xDE,
+        .. "ZXCVBNM".Select(c => (ushort)c), 0xBC, 0xBE, 0xBF, 0xC0, .. "1234567890".Select(c => (ushort)c), 0xBD, 0xBB, 0xDC, 0x20,
+    ];
+
+    /// <summary>Type characters by their US key positions (what you'd see with the English layout).</summary>
+    private static void TypeKeys(string usKeys, int settle = 250)
     {
         foreach (var ch in usKeys)
         {
-            ushort vk = ch switch { ' ' => 0x20, ',' => 0xBC, '.' => 0xBE, ';' => 0xBA, '\'' => 0xDE, '[' => 0xDB, ']' => 0xDD, _ => char.ToUpperInvariant(ch) };
-            if (char.IsUpper(ch)) Tap(vk, 0xA0); else Tap(vk);
+            if (ch == '\n') { Tap(0x0D); continue; }
+            int i = UsLower.IndexOf(ch);
+            if (i >= 0) { Tap(UsVk[i]); continue; }
+            i = UsUpper.IndexOf(ch);
+            if (i < 0) throw new ArgumentException($"no US key for '{ch}'");
+            Tap(UsVk[i], 0xA0);
         }
-        Pump(250);
+        Pump(settle);
+    }
+
+    private static void Click(Control c)
+    {
+        EnsureForeground();
+        var p = c.PointToScreen(new Point(c.Width / 2, c.Height / 2));
+        var vs = SystemInformation.VirtualScreen;
+        int dx = (int)((p.X - vs.Left) * 65535.0 / (vs.Width - 1)), dy = (int)((p.Y - vs.Top) * 65535.0 / (vs.Height - 1));
+        const uint MOVE = 0x1, LDOWN = 0x2, LUP = 0x4, ABS = 0x8000, VDESK = 0x4000;
+        Native.INPUT M(uint f) => new() { type = 0, U = new Native.InputUnion { mi = new Native.MOUSEINPUT { dx = dx, dy = dy, dwFlags = f | ABS | VDESK | MOVE } } };
+        SendInput(3, [M(0), M(LDOWN), M(LUP)], Marshal.SizeOf<Native.INPUT>());
+        Pump(80);
     }
 
     /// <summary>Pump messages until the condition holds (or the timeout passes).</summary>
@@ -87,7 +143,11 @@ internal static class E2E
         engine.Start();
 
         void SetLang(Lang l) { layouts.Switch(l, tb.Handle); Pump(200); }
-        void Reset() { tb.Clear(); Tap(0x23); Pump(100); } // End key resets the engine's buffer
+        void Reset() { PumpUntil(() => !engine.Busy, 5000); tb.Clear(); Tap(0x23); Pump(100); } // wait for clipboard work; End resets the buffer
+
+        AllowedForeground.Add(form.Handle);
+        try
+        {
 
         // 1. wrong layout EN → RU
         Reset(); SetLang(Lang.En);
@@ -101,7 +161,21 @@ internal static class E2E
         Expect("auto RU→EN", tb.Text, "hello ");
         Tap(0x08); Pump(200);
         Expect("undo by Backspace", tb.Text, "руддщ ");
-        Expect("learned exception", settings.ExceptionWords.Contains("руддщ").ToString(), "True");
+        Expect("one undo doesn't learn", settings.ExceptionWords.Contains("руддщ").ToString(), "False");
+        Reset(); SetLang(Lang.Ru);
+        TypeKeys("hello ");
+        Tap(0x08); Pump(200);
+        Expect("second undo learns", settings.ExceptionWords.Contains("руддщ").ToString(), "True");
+        Reset(); SetLang(Lang.Ru);
+        TypeKeys("hello ");
+        Expect("learned word stays", tb.Text, "руддщ ");
+        settings.ExceptionWords.Remove("руддщ"); engine.ReloadSettings();
+        // Backspace long after the correction is an ordinary Backspace
+        Reset(); SetLang(Lang.En);
+        TypeKeys("ghbdtn ");
+        Pump(3200);
+        Tap(0x08); Pump(200);
+        Expect("late Backspace just deletes", tb.Text, "привет");
 
         // 3. correct words untouched, sentence
         Reset(); SetLang(Lang.Ru);
@@ -242,9 +316,185 @@ internal static class E2E
         Expect("DND keeps text", tb.Text, "ghbdtn ");
         engine.SetDnd(null);
 
+        Robustness(engine, settings, form, tb, SetLang, Reset, Expect);
+        }
+        catch (FocusLostException ex)
+        {
+            failed++;
+            Console.WriteLine($"ABORTED: another window took the focus ({ex.Message}); stopped typing to keep input out of it");
+        }
+        finally
+        {
+            AllowedForeground.Clear();
+            foreach (ushort m in new ushort[] { 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5 }) SendKey(m, true, IsExtended(m));
+            if (Control.IsKeyLocked(System.Windows.Forms.Keys.CapsLock)) { SendKey(0x14, false); SendKey(0x14, true); }
+        }
+
         form.Close();
         File.Delete(Settings.FilePath);
         Console.WriteLine(failed == 0 ? "E2E: all passed" : $"E2E: {failed} failed");
         return failed;
+    }
+
+    private static IEnumerable<Control> Descendants(Control c)
+    {
+        foreach (Control x in c.Controls)
+        {
+            yield return x;
+            foreach (var y in Descendants(x)) yield return y;
+        }
+    }
+
+    /// <summary>
+    /// Long, messy editor sessions. The engine must survive every one of them (checked by typing a sentinel
+    /// word in the wrong layout) and must never touch editor tokens typed in the right layout.
+    /// </summary>
+    private static void Robustness(Engine engine, Settings settings, Form form, TextBox tb,
+        Action<Lang> SetLang, Action Reset, Action<string, string, string> Expect)
+    {
+        string? savedClipboard = null;
+        try { savedClipboard = Clipboard.ContainsText() ? Clipboard.GetText() : null; } catch { }
+        var recent = new Queue<string>();
+        void Note(string a) { recent.Enqueue(a); while (recent.Count > 15) recent.Dequeue(); }
+
+        bool Alive(string label)
+        {
+            foreach (ushort m in new ushort[] { 0xA0, 0xA1, 0xA2, 0xA3 }) SendKey(m, true, IsExtended(m));
+            if (Control.IsKeyLocked(System.Windows.Forms.Keys.CapsLock)) Tap(0x14);
+            Reset(); SetLang(Lang.En);
+            TypeKeys("cjkywt ");
+            bool ok = tb.Text == "солнце ";
+            Expect(label, tb.Text, "солнце ");
+            if (!ok)
+            {
+                Console.WriteLine("  last actions: " + string.Join(" | ", recent));
+                foreach (var line in engine.Diagnostics().Split(Environment.NewLine)) Console.WriteLine("  state: " + line);
+                Console.WriteLine("  state: exceptions = [" + string.Join(", ", settings.ExceptionWords) + "]");
+            }
+            // Forget the checkpoint's own correction: a Backspace in the next random step would otherwise "undo" it
+            // and, after two such undos, teach the engine to never correct the checkpoint word.
+            Reset();
+            return ok;
+        }
+
+        // 12. Unity / IDE / shell tokens typed in the right layout stay exactly as typed
+        string[] tokens =
+        [
+            "t:Prefab", "t:Material", "t:Scene", "l:Environment", "ref:Player", "Assets/Prefabs", "Vector3.zero",
+            "transform.position", "GetComponent<Rigidbody>()", "[SerializeField]", "Debug.Log", "OnTriggerEnter",
+            "deltaTime", "m_Speed", "#if", "std::vector", "x=5;", "i++", "e.g.", "git", "npm", "ctx", "lerp", "navmesh",
+            "asmdef", "wasd", "qwe",
+        ];
+        foreach (var t in tokens)
+        {
+            Reset(); SetLang(Lang.En);
+            TypeKeys(t + " ", 120);
+            Expect($"editor token kept: {t}", tb.Text, t + " ");
+        }
+        foreach (var (k, w) in new[] { ("rjvvbn", "коммит"), (",bkl", "билд"), ("ghtaf,", "префаб"), ("lt,fu", "дебаг"), ("rjvgjytyn", "компонент") })
+        {
+            Reset(); SetLang(Lang.Ru);
+            TypeKeys(k + " ", 120);
+            Expect($"RU slang kept: {w}", tb.Text, w + " ");
+        }
+
+        // 13. Windows silently drops the keyboard hook → the witness hook notices and re-installs it
+        int before = engine.HookReinstalls;
+        engine.DropKeyboardHookForTest();
+        Reset(); SetLang(Lang.En);
+        TypeKeys("zzzz", 100);
+        PumpUntil(() => engine.HookReinstalls > before, 3000);
+        Expect("watchdog re-installed a dropped hook", (engine.HookReinstalls > before).ToString(), "True");
+        Alive("alive after the hook was dropped");
+
+        // 14. our thread stalls longer than LowLevelHooksTimeout while the user keeps typing
+        before = engine.HookReinstalls;
+        Reset(); SetLang(Lang.En);
+        var typist = new Thread(() =>
+        {
+            for (int i = 0; i < 8; i++) { Thread.Sleep(300); SendKey(0x5A, false); SendKey(0x5A, true); }
+        });
+        typist.Start();
+        Thread.Sleep(3500); // not pumping messages: the hook cannot run
+        typist.Join();
+        Pump(300);
+        TypeKeys("zzzz", 100);
+        Pump(1200);
+        Console.WriteLine($"  info: hook re-installs after the stall: {engine.HookReinstalls - before}");
+        Alive("alive after a 3.5 s stall");
+
+        // 15. settings window left open with a hotkey box focused, the user goes back to work
+        var sf = new SettingsForm(settings, engine, () => { });
+        sf.Show();
+        sf.SelectTab(1);
+        var sfHandle = sf.Handle;
+        AllowedForeground.Add(sfHandle);
+        Native.SetForegroundWindow(sf.Handle); sf.Activate(); Pump(200);
+        var hb = Descendants(sf).OfType<HotkeyBox>().First();
+        hb.Focus(); Pump(200);
+        Console.WriteLine($"  info: hotkey box focused, suspended there: {engine.IsSuspended}");
+        Native.SetForegroundWindow(form.Handle); form.Activate(); tb.Focus(); Pump(300);
+        Alive("alive while settings are left open in the background");
+        sf.Close(); Pump(100);
+        AllowedForeground.Remove(sfHandle);
+
+        // 16. a long editing session: shortcuts, navigation, mouse, Caps Lock, stuck modifiers, layout hotkeys...
+        int seed = int.TryParse(Environment.GetEnvironmentVariable("OKB_SEED"), out var sd) ? sd : 20261106;
+        Console.WriteLine($"  info: editing session seed {seed}");
+        var rnd = new Random(seed);
+        string[] enOk = ["hello", "world", "update", "build", "prefab", "shader", "the", "project", "player", "t:Prefab", "Vector3.zero", "ctx.Pos"];
+        string[] ruOk = ["ghbdtn", "vbh", "ntcn", "ghjtrn", "rjvvbn", "cgfcb,j", "lf", "ytn"]; // correct Russian, typed in RU layout
+        ushort[][] combos =
+        [
+            [0x41, 0xA2], [0x43, 0xA2], [0x56, 0xA2], [0x58, 0xA2], [0x5A, 0xA2], [0x59, 0xA2], [0x53, 0xA2], [0x44, 0xA2],
+            [0x46, 0xA2], [0x5A, 0xA2, 0xA0], [0x46, 0xA2, 0xA0], [0x20, 0xA2], [0x20, 0xA0], [0x08, 0xA2], [0x25, 0xA2],
+            [0x27, 0xA2], [0x24, 0xA2], [0x23, 0xA2], [0x25, 0xA0], [0x27, 0xA0], [0x24, 0xA0], [0x23, 0xA0], [0x2E, 0xA2],
+            [0x4B, 0xA2], [0x50, 0xA2, 0xA0], [0x70, 0xA0], [0x09, 0xA2], [0x1B, 0xA0],
+        ];
+        ushort[] nav = [0x25, 0x26, 0x27, 0x28, 0x24, 0x23, 0x21, 0x22, 0x2E, 0x1B, 0x71, 0x72, 0x74, 0x7B];
+        int checkpoints = 0, alive = 0;
+        Reset();
+        for (int step = 1; step <= 400; step++)
+        {
+            if (tb.TextLength > 4000) { tb.Clear(); Note("clear"); }
+            int r = rnd.Next(100);
+            if (r < 30)
+            {
+                bool ru = rnd.Next(2) == 0;
+                bool wrong = rnd.Next(4) == 0;
+                var lang = ru ^ wrong ? Lang.Ru : Lang.En;
+                if (layoutsCurrent() != lang) SetLang(lang);
+                var w = ru ? ruOk[rnd.Next(ruOk.Length)] : enOk[rnd.Next(enOk.Length)];
+                TypeKeys(w + (rnd.Next(5) == 0 ? "\n" : " "), 30);
+                Note($"type[{lang}] {w}");
+            }
+            else if (r < 50) { var c = combos[rnd.Next(combos.Length)]; Tap(c[0], c[1..]); Note($"combo {string.Join("+", c.Select(x => x.ToString("X2")))}"); }
+            else if (r < 62) { var k = nav[rnd.Next(nav.Length)]; Tap(k); Note($"nav {k:X2}"); }
+            else if (r < 67) { Click(tb); Note("click"); }
+            else if (r < 70) { Tap(0x14); Note("caps"); }
+            else if (r < 74)
+            {
+                // a modifier whose release the engine never saw (Win+Shift+S, UAC, lock screen...)
+                ushort m = rnd.Next(2) == 0 ? (ushort)0xA2 : (ushort)0xA0;
+                Key(m, false); SendKey(m, true, marked: true); Pump(30);
+                Note($"stuck {m:X2}");
+            }
+            else if (r < 78) { Tap(0x13, rnd.Next(3) switch { 0 => new ushort[0], 1 => new ushort[] { 0xA4 }, _ => new ushort[] { 0xA0 } }); Pump(300); PumpUntil(() => !engine.Busy, 3000); Note("pause-hotkey"); }
+            else if (r < 82) { Tap(0xA0, 0xA4); Note("alt+shift"); }
+            else if (r < 88) { for (int i = rnd.Next(1, 6); i > 0; i--) Tap(0x08); Note("backspaces"); }
+            else if (r < 94) { Tap(rnd.Next(2) == 0 ? (ushort)0x0D : (ushort)0x09); Note("enter/tab"); }
+            else { TypeKeys(new string(Enumerable.Range(0, rnd.Next(1, 4)).Select(_ => "qwertasdfzxc"[rnd.Next(12)]).ToArray()), 20); Note("bare letters"); }
+
+            if (step % 40 == 0)
+            {
+                checkpoints++;
+                if (Alive($"alive at step {step}")) alive++;
+            }
+        }
+        Console.WriteLine($"  info: editing session: {checkpoints} checkpoints, {alive} alive, {engine.HookReinstalls} hook re-installs total, " +
+                          $"exceptions learned: [{string.Join(", ", settings.ExceptionWords)}]");
+
+        Lang? layoutsCurrent() => engine.CurrentLang;
+        try { if (savedClipboard != null) Clipboard.SetText(savedClipboard); } catch { }
     }
 }

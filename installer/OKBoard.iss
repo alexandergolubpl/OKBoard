@@ -63,8 +63,15 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\OKBoard.exe"; Description: "{cm:LaunchProgram,OKBoard}"; Flags: nowait postinstall skipifsilent
+; Auto-update (silent install started by the app itself with /relaunch=1): start the new version again.
+Filename: "{app}\OKBoard.exe"; Flags: nowait skipifnotsilent; Check: ShouldRelaunch
 
 [Code]
+function ShouldRelaunch: Boolean;
+begin
+  Result := ExpandConstant('{param:relaunch|0}') = '1';
+end;
+
 // The app lives in the tray (no main window), so close it explicitly before files are replaced/removed.
 procedure CloseOKBoard;
 var

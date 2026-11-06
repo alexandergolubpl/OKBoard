@@ -13,9 +13,18 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
+        Engine.Trace = DiagLog.Write;
+        Application.ThreadException += (_, e) => DiagLog.Write("unhandled: " + e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) => DiagLog.Write("fatal: " + e.ExceptionObject);
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
 
         var settings = Settings.Load();
+        Theme.Set(Theme.Parse(settings.Theme));
+        Microsoft.Win32.SystemEvents.UserPreferenceChanged += (_, e) =>
+        {
+            if (e.Category is Microsoft.Win32.UserPreferenceCategory.General or Microsoft.Win32.UserPreferenceCategory.VisualStyle)
+                Theme.Refresh();
+        };
         var layouts = new LayoutManager();
         if (!layouts.HasLatinAndCyrillic)
         {

@@ -8,7 +8,7 @@ public sealed record CorrectionEntry(DateTime Time, string App, string From, str
 /// <summary>
 /// Core of the switcher: watches keystrokes, keeps a buffer of the current line, auto-corrects words typed in
 /// the wrong layout, expands abbreviations and executes hotkey actions. Everything runs on the UI thread
-/// (low-level hooks are delivered there).
+/// (low-level hooks are delivered there). A watchdog re-installs the hooks if Windows drops them.
 /// </summary>
 internal sealed class Engine : IDisposable
 {
@@ -31,6 +31,8 @@ internal sealed class Engine : IDisposable
     private Lang? _wordStartLang;
     private Lang? _lastCyrillic;
     private AutoFix? _lastAuto;
+    private readonly Dictionary<string, int> _undoCounts = new(StringComparer.OrdinalIgnoreCase);
+    private const int UndoWindowMs = 3000, UndoesToLearn = 2;
     private ManualCycle? _cycle;
     private bool _busy;
     private bool _savePending;
@@ -43,15 +45,44 @@ internal sealed class Engine : IDisposable
     private string? _procCacheName;
 
     private IntPtr _kbHook, _mouseHook, _fgHook;
-    private int _lastHookTick = Environment.TickCount, _lastReinstallTick;
+    private int _lastHookTick = Environment.TickCount;
+    private long _lastReinstall = long.MinValue / 2;
+    private KeyboardWitness? _witness;
+    private System.Windows.Forms.Timer? _watchdog;
+    private long _witnessAtLastKey;   // raw-input key count when the hook last saw a key
+    private int _suspectChecks;       // consecutive watchdog checks that found keys the hook missed
+    private IntPtr _suspendRoot;
+
+    public int HookReinstalls { get; private set; }
+    public string? LastReinstallReason { get; private set; }
+    public DateTime LastReinstallTime { get; private set; }
+    public long LastHookKeyTick { get; private set; }
+    public bool WitnessActive => _witness?.Active == true;
     private readonly LowLevelProc _kbProc, _mouseProc;
     private readonly WinEventProc _fgProc;
 
     public DateTime DndUntil { get; private set; } = DateTime.MinValue;
     public bool IsDnd => DateTime.Now < DndUntil;
     public bool IsFullscreenPaused => _s.PauseInFullscreen && IsFullscreen();
-    /// <summary>Set while one of our own input windows has focus (hotkey box, clipboard popup).</summary>
-    public bool Suspended { get; set; }
+    /// <summary>
+    /// Pause processing while one of our own input windows (hotkey box, clipboard popup) is in front.
+    /// Tied to that window: if it is left open in the background (or a Leave event never comes), typing in
+    /// every other app keeps working. A global flag here used to switch the program off everywhere.
+    /// </summary>
+    public void SuspendFor(IntPtr hwnd) => _suspendRoot = hwnd == IntPtr.Zero ? IntPtr.Zero : GetAncestor(hwnd, GA_ROOT);
+    public void Resume() => _suspendRoot = IntPtr.Zero;
+
+    public bool IsSuspended
+    {
+        get
+        {
+            var root = _suspendRoot;
+            if (root == IntPtr.Zero) return false;
+            if (!IsWindow(root)) { _suspendRoot = IntPtr.Zero; return false; }
+            return GetAncestor(GetForegroundWindow(), GA_ROOT) == root;
+        }
+    }
+    private const uint GA_ROOT = 2;
     /// <summary>True while we are copying/pasting on the user's behalf (clipboard history ignores those copies).</summary>
     public bool Busy => _busy;
 
@@ -65,7 +96,11 @@ internal sealed class Engine : IDisposable
 
     /// <param name="ConvertedLength">Characters to delete to undo (newlines count as one).</param>
     private sealed record AutoFix(List<KeyStroke> OriginalKeys, int ConvertedLength, Lang From, bool Switched,
-        string Original, string Converted, bool IsSnippet);
+        string Original, string Converted, bool IsSnippet)
+    {
+        /// <summary>When the correction happened: Backspace undoes it only shortly afterwards.</summary>
+        public long Tick { get; } = Environment.TickCount64;
+    }
 
     /// <summary>State of repeated Pause presses on the same word: cycle through the installed layouts.</summary>
     private sealed record ManualCycle(int Start, int Count, List<Lang> Sequence, int Index);
@@ -87,9 +122,29 @@ internal sealed class Engine : IDisposable
 
     public void Start()
     {
+        _witness = new KeyboardWitness(InjectMarker); // before the main hook, see KeyboardWitness
         InstallInputHooks();
         _fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, _fgProc, 0, 0, WINEVENT_OUTOFCONTEXT);
         if (_kbHook == IntPtr.Zero) throw new InvalidOperationException("Не удалось установить перехват клавиатуры: " + Marshal.GetLastWin32Error());
+
+        _watchdog = new System.Windows.Forms.Timer { Interval = 500 };
+        _watchdog.Tick += (_, _) => CheckHookHealth();
+        _watchdog.Start();
+        Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
+        Microsoft.Win32.SystemEvents.PowerModeChanged += OnPowerModeChanged;
+        Trace?.Invoke($"started (key witness: {_witness.Active})");
+    }
+
+    private void OnSessionSwitch(object? sender, Microsoft.Win32.SessionSwitchEventArgs e)
+    {
+        if (e.Reason is Microsoft.Win32.SessionSwitchReason.SessionUnlock or Microsoft.Win32.SessionSwitchReason.ConsoleConnect
+            or Microsoft.Win32.SessionSwitchReason.RemoteConnect)
+            _ui.Post(_ => ReinstallHooks("session " + e.Reason), null);
+    }
+
+    private void OnPowerModeChanged(object? sender, Microsoft.Win32.PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == Microsoft.Win32.PowerModes.Resume) _ui.Post(_ => ReinstallHooks("resume"), null);
     }
 
     private void InstallInputHooks()
@@ -100,22 +155,51 @@ internal sealed class Engine : IDisposable
     }
 
     /// <summary>
-    /// Windows silently removes a low-level hook if it ever exceeds LowLevelHooksTimeout. If the system saw
-    /// input recently but our hooks did not, reinstall them. Called periodically from the UI timer.
+    /// Windows silently removes a low-level hook if its callback ever exceeds LowLevelHooksTimeout (e.g. our
+    /// thread stalled for a few seconds on a slow clipboard owner). Two independent checks, run every 500 ms:
+    /// the witness hook saw key presses the main hook did not; or the system saw input that neither hook did.
     /// </summary>
     public void CheckHookHealth()
     {
+        // 1) Keys the witness hook (own thread) counted since the main hook last saw one. The witness is called
+        //    after the main hook, so a healthy main hook keeps this at 0..1; require it on two checks in a row.
+        long missed = _witness is { Active: true } w ? w.KeyDowns - _witnessAtLastKey : 0;
+        _suspectChecks = missed >= 3 ? _suspectChecks + 1 : 0;
+        if (_suspectChecks >= 2)
+        {
+            ReinstallHooks($"keyboard hook missed {missed} keys");
+            return;
+        }
+        // 2) Fallback without raw input (also covers the mouse hook).
         var info = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>() };
         if (!GetLastInputInfo(ref info)) return;
-        int sinceInputSeen = (int)(info.dwTime - (uint)_lastHookTick);
-        if (sinceInputSeen < 3000 || Environment.TickCount - _lastReinstallTick < 30000) return;
-        _lastReinstallTick = Environment.TickCount;
+        int sinceInputSeen = (int)(info.dwTime - (uint)_lastHookTick); // uint arithmetic: safe across the 49.7-day wrap
+        if (sinceInputSeen >= 3000) ReinstallHooks("input not seen by hooks");
+    }
+
+    /// <summary>Tests: simulate Windows silently removing the keyboard hook (the handle is kept, as in real life).</summary>
+    internal void DropKeyboardHookForTest() => UnhookWindowsHookEx(_kbHook);
+
+    /// <summary>Unhook and hook again (cheap; safe to call any time on the UI thread).</summary>
+    public void ReinstallHooks(string reason)
+    {
+        // Throttle automatic re-installs (e.g. elevated windows, where UIPI hides input from our hook).
+        var now = Environment.TickCount64;
+        if (!reason.StartsWith("manual") && now - _lastReinstall < (reason.StartsWith("input not seen") ? 30000 : 5000)) { _suspectChecks = 0; _witnessAtLastKey = _witness?.KeyDowns ?? 0; return; }
+        _lastReinstall = now;
         if (_kbHook != IntPtr.Zero) UnhookWindowsHookEx(_kbHook);
         if (_mouseHook != IntPtr.Zero) UnhookWindowsHookEx(_mouseHook);
         InstallInputHooks();
         _lastHookTick = Environment.TickCount;
+        _suspectChecks = 0;
+        _witnessAtLastKey = _witness?.KeyDowns ?? 0;
+        _held.Clear();
         ResetLine();
-        Trace?.Invoke("hooks reinstalled");
+        HookReinstalls++;
+        LastReinstallReason = reason;
+        LastReinstallTime = DateTime.Now;
+        Trace?.Invoke($"hooks reinstalled: {reason} (ok={_kbHook != IntPtr.Zero})");
+        StateChanged?.Invoke();
     }
 
     public void Dispose()
@@ -124,6 +208,10 @@ internal sealed class Engine : IDisposable
         if (_mouseHook != IntPtr.Zero) UnhookWindowsHookEx(_mouseHook);
         if (_fgHook != IntPtr.Zero) UnhookWinEvent(_fgHook);
         _kbHook = _mouseHook = _fgHook = IntPtr.Zero;
+        Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
+        Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        _watchdog?.Dispose();
+        _witness?.Dispose();
         _clipboard.Dispose();
     }
 
@@ -200,6 +288,11 @@ internal sealed class Engine : IDisposable
             bool down = msg is WM_KEYDOWN or WM_SYSKEYDOWN;
             if (k.dwExtraInfo != InjectMarker)
             {
+                if (down)
+                {
+                    _witnessAtLastKey = _witness?.KeyDowns ?? 0;
+                    LastHookKeyTick = Environment.TickCount64;
+                }
                 try
                 {
                     if (HandleKey((ushort)k.vkCode, down)) return 1;
@@ -290,7 +383,7 @@ internal sealed class Engine : IDisposable
         {
             bool first = !_capsKeyDown;
             _capsKeyDown = true;
-            if (_s.CapsLockSwitchesLayout && !ShiftHeld && !CtrlHeld && !AltHeld && !Suspended)
+            if (_s.CapsLockSwitchesLayout && !ShiftHeld && !CtrlHeld && !AltHeld && !IsSuspended)
             {
                 if (first) ToggleLayout();
                 _swallowCapsUp = true;
@@ -299,7 +392,7 @@ internal sealed class Engine : IDisposable
             return false;
         }
 
-        if (Suspended) return false;
+        if (IsSuspended) return false;
         if (IsFullscreenPaused) { ResetLine(); return false; }
 
         // Hotkeys
@@ -324,7 +417,7 @@ internal sealed class Engine : IDisposable
 
         if (vk == VK_BACK)
         {
-            if (_lastAuto != null && _s.UndoWithBackspace)
+            if (_lastAuto != null && _s.UndoWithBackspace && Environment.TickCount64 - _lastAuto.Tick <= UndoWindowMs)
             {
                 UndoAuto();
                 return true;
@@ -367,7 +460,7 @@ internal sealed class Engine : IDisposable
             return;
         }
         _shiftDown = false;
-        if (!_shiftAlone || !_s.DoubleShiftConverts || Suspended || IsFullscreenPaused) { _shiftAlone = false; return; }
+        if (!_shiftAlone || !_s.DoubleShiftConverts || IsSuspended || IsFullscreenPaused) { _shiftAlone = false; return; }
         _shiftAlone = false;
         var now = Environment.TickCount64;
         if (_lastShiftTap != 0 && now - _lastShiftTap < 400)
@@ -434,10 +527,49 @@ internal sealed class Engine : IDisposable
         if (now - _fullscreenCheckedAt > 1500)
         {
             _fullscreenCheckedAt = now;
-            // QUNS_BUSY (2), QUNS_RUNNING_D3D_FULL_SCREEN (3), QUNS_PRESENTATION_MODE (4)
-            _fullscreenCached = SHQueryUserNotificationState(out var st) == 0 && st is 2 or 3 or 4;
+            // QUNS_RUNNING_D3D_FULL_SCREEN (3) and QUNS_PRESENTATION_MODE (4) are unambiguous. QUNS_BUSY (2) also
+            // stays set while *any* window is full-screen, e.g. a video on the second monitor, so for it we
+            // pause only if the window being typed into is itself full-screen.
+            int st = SHQueryUserNotificationState(out var s) == 0 ? s : 0;
+            _fullscreenCached = st is 3 or 4 || (st == 2 && ForegroundCoversMonitor());
         }
         return _fullscreenCached;
+    }
+
+    private static bool ForegroundCoversMonitor()
+    {
+        var fg = GetForegroundWindow();
+        if (fg == IntPtr.Zero || !GetWindowRect(fg, out var r)) return false;
+        var sb = new System.Text.StringBuilder(64);
+        GetClassName(fg, sb, sb.Capacity);
+        if (sb.ToString() is "Progman" or "WorkerW" or "Shell_TrayWnd") return false; // the desktop itself
+        var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(MonitorFromWindow(fg, 2 /* NEAREST */), ref mi)) return false;
+        return r.Left <= mi.rcMonitor.Left && r.Top <= mi.rcMonitor.Top && r.Right >= mi.rcMonitor.Right && r.Bottom >= mi.rcMonitor.Bottom;
+    }
+
+    /// <summary>Human-readable state for the "Diagnostics" window. Contains no typed text.</summary>
+    public string Diagnostics()
+    {
+        var fgProc = ForegroundProcess() ?? "?";
+        long sinceKey = LastHookKeyTick == 0 ? -1 : (Environment.TickCount64 - LastHookKeyTick) / 1000;
+        var lines = new List<string>
+        {
+            $"Перехват клавиатуры: {(_kbHook != IntPtr.Zero ? "установлен" : "НЕТ")}, последнее нажатие {(sinceKey < 0 ? "ещё не было" : $"{sinceKey} с назад")}",
+            $"Сторож перехвата: {(WitnessActive ? "работает" : "недоступен")}; переустановок перехвата: {HookReinstalls}"
+                + (LastReinstallReason != null ? $" (последняя {LastReinstallTime:HH:mm:ss}: {LastReinstallReason})" : ""),
+            $"Автопереключение: {(_s.AutoSwitch ? "включено" : "ВЫКЛЮЧЕНО (меню трея → «Автопереключение раскладки»)")}",
+            $"Исключений (слов, которые не исправляются): {_exceptions.Count}",
+            $"Не беспокоить: {(IsDnd ? $"ВКЛЮЧЕНО до {DndUntil:HH:mm}" : "нет")}",
+            $"Пауза в полноэкранном режиме: {(IsFullscreenPaused ? "ДА (сейчас пауза)" : "нет")}",
+            $"Приостановлено своим окном: {(IsSuspended ? "ДА" : "нет")}",
+            $"Выполняется операция с буфером: {(_busy ? "ДА" : "нет")}",
+            $"Активное приложение: {fgProc}{(IsExcludedApp(fgProc) ? " (В ИСКЛЮЧЕНИЯХ)" : "")}",
+            $"Удерживаемые модификаторы (по данным программы): {(_held.Count == 0 ? "нет" : string.Join(", ", _held.Select(v => $"0x{v:X2}")))}",
+            $"Раскладка сейчас: {CurrentLang?.ToString() ?? "не распознана"}; установлены: {string.Join(", ", _layouts.Installed)}",
+            $"Словари: {string.Join(", ", new[] { Lang.En, Lang.Ru, Lang.Uk }.Where(_layouts.Has).Select(l => $"{l}={(_detector.HasDictionary(l) ? "есть" : "нет")}"))}",
+        };
+        return string.Join(Environment.NewLine, lines);
     }
 
     private bool OnBoundary(ushort vk)
@@ -582,12 +714,29 @@ internal sealed class Engine : IDisposable
             _line.RemoveRange(start, a.OriginalKeys.Count);
             _line.InsertRange(start, a.OriginalKeys);
         }
-        if (a.Switched && _s.LearnFromUndo)
-        {
-            AddException(LanguageDetector.Core(a.Original, a.From));
+        if (a.Switched && _s.LearnFromUndo && LearnFromUndo(LanguageDetector.Core(a.Original, a.From)))
             AddLog(a.Converted, a.Original, "отмена → в исключения");
-        }
         else AddLog(a.Converted, a.Original, "отмена");
+    }
+
+    /// <summary>
+    /// Backspace right after a correction is also how people delete the space or fix a typo, so one undo is not
+    /// proof that the detector was wrong. Learning from every single undo used to fill the exception list with
+    /// everyday words (привет, как, надо...) until auto-correction quietly stopped working. Now a word becomes
+    /// an exception only when its correction is undone twice.
+    /// </summary>
+    /// <returns>True if the word was added to the exceptions.</returns>
+    private bool LearnFromUndo(string word)
+    {
+        word = word.Trim().ToLowerInvariant();
+        if (word.Length == 0) return false;
+        int n = _undoCounts.GetValueOrDefault(word) + 1;
+        _undoCounts[word] = n;
+        if (n < UndoesToLearn) return false;
+        _undoCounts.Remove(word);
+        AddException(word);
+        Notify?.Invoke($"«{word}» больше не исправляется (исправление отменено дважды). Убрать можно в настройках, вкладка «Исключения».");
+        return true;
     }
 
     private void AddLog(string from, string to, string kind)
@@ -610,7 +759,10 @@ internal sealed class Engine : IDisposable
 
     private async void Run(HotkeyAction action, IntPtr fg)
     {
-        if (_busy) return;
+        // A previous clipboard operation may still be restoring the user's clipboard (clipboard managers make
+        // that take ~0.5 s). Wait for it instead of silently dropping the key press.
+        for (int i = 0; i < 40 && _busy; i++) await Task.Delay(50);
+        if (_busy) { Trace?.Invoke($"hotkey {action} dropped: busy"); return; }
         bool editing = action is not (HotkeyAction.ToggleDoNotDisturb or HotkeyAction.AddException);
         // The user switched windows between the key press and now: don't type into the wrong window.
         if (editing && GetForegroundWindow() != fg) return;
@@ -728,7 +880,7 @@ internal sealed class Engine : IDisposable
 
         // Converting back a word we auto-corrected a moment ago means the detector was wrong: learn from it.
         if (!phrase && _lastAuto is { Switched: true, IsSnippet: false } a && _s.LearnFromUndo)
-            AddException(LanguageDetector.Core(a.Original, a.From));
+            LearnFromUndo(LanguageDetector.Core(a.Original, a.From));
         _lastAuto = null;
 
         InputSender.ReleaseModifiers(_held);
@@ -867,6 +1019,7 @@ internal sealed class Engine : IDisposable
         }
 
         _busy = true;
+        bool changed = false; // only then is the line buffer out of date; otherwise the user may already be typing
         try
         {
             InputSender.ReleaseModifiers(_held);
@@ -897,6 +1050,7 @@ internal sealed class Engine : IDisposable
             if (abort) { backup.Restore(); return; }
 
             var result = f(text);
+            changed = true;
             if (await PasteViaClipboard(result, fg, backup) && GetForegroundWindow() == fg)
             {
                 int len = VisibleLength(result);
@@ -912,7 +1066,7 @@ internal sealed class Engine : IDisposable
         finally
         {
             _busy = false;
-            ResetLine();
+            if (changed) ResetLine();
         }
     }
 

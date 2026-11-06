@@ -1,5 +1,5 @@
 # Builds the self-contained exe, the portable copy and the installer into .\dist
-param([string]$Version = "0.2.2")
+param([string]$Version = "0.2.3")
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $pub = Join-Path $root "publish\selfcontained"

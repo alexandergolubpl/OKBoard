@@ -165,6 +165,10 @@ public sealed class LanguageDetector
         }
 
         if (IsBroken(altCore, other)) return No("alternative is not a word");
+        // An upper-case letter inside the converted word comes from Shift+punctuation in code ("t:Prefab" → "еЖЗкуаф",
+        // "a<b>" ...), never from a real word typed in the wrong layout.
+        for (int i = 1; i < altCore.Length; i++)
+            if (char.IsUpper(altCore[i]) && char.IsLower(altCore[i - 1])) return No("alternative has mixed case");
 
         var od = _data[other];
         if (altCore.Length == 2)
