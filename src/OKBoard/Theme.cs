@@ -42,7 +42,7 @@ internal static class Theme
     public const char GSettings = '', GKeyboard = '', GEdit = '', GBlock = '', GApps = '',
         GHistory = '', GClipboard = '', GDelete = '', GSwitch = '', GBellOff = '',
         GPulse = '', GPlay = '', GPower = '', GMoon = '', GSun = '', GContrast = '',
-        GChevron = '', GCheck = '', GFolder = '', GInfo = '', GSync = (char)0xE895;
+        GChevron = '', GCheck = '', GFolder = '', GInfo = '', GSync = (char)0xE895, GRules = (char)0xE9E9;
 
     public static ThemeMode Mode { get; private set; } = ThemeMode.System;
     public static Palette P { get; private set; } = Resolve(ThemeMode.System);

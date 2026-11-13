@@ -52,6 +52,21 @@ public sealed class Settings
     public bool PauseInFullscreen { get; set; } = true;
     public bool UndoWithBackspace { get; set; } = true;
     public bool LearnFromUndo { get; set; } = true;
+    /// <summary>User rules, one per line: "[app.exe:] pattern = да|нет|en|ru|uk" (see RuleParser).</summary>
+    public List<string> Rules { get; set; } = RuleParser.Examples;
+    /// <summary>Don't auto-correct a word started right after the user changed the layout by hand.</summary>
+    public bool TrustManualSwitch { get; set; } = true;
+    /// <summary>0 = careful, 1 = normal, 2 = active (default).</summary>
+    public int Aggressiveness { get; set; } = 2;
+    /// <summary>Active level: fix the start of a word while it's still being typed (as Caramba does).</summary>
+    public bool SwitchWhileTyping { get; set; } = true;
+    /// <summary>"z ndjq" → "я твой": also fix a short word right before a corrected one.</summary>
+    public bool FixShortWordBefore { get; set; } = true;
+    /// <summary>Learn from manual corrections (Pause): un-except the word, and after two, always correct it.</summary>
+    public bool LearnFromManual { get; set; } = true;
+    /// <summary>One-time cleanup of exceptions learned by older versions from single Backspace undos.</summary>
+    public bool LegacyExceptionsCleaned { get; set; }
+    public List<string> RemovedLegacyExceptions { get; set; } = [];
     public bool SoundOnAutoSwitch { get; set; } = false;
     public bool SkipPasswordFields { get; set; } = true;
     /// <summary>Don't auto-correct a lone word followed by Enter/Tab (that's how passwords are typed in browsers).</summary>

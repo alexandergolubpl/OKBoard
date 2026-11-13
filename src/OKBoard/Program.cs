@@ -35,6 +35,7 @@ internal static class Program
 
         // OS spell checkers for the installed languages (Ukrainian may be missing — the detector is stricter then).
         var spell = new Dictionary<Lang, Func<string, bool?>>();
+        var checkers = new List<SpellChecker>();
         foreach (var (lang, primary, tags) in new[]
                  {
                      (Lang.En, "en", new[] { "en-US", "en-GB", "en-AU", "en-IE" }),
@@ -46,9 +47,12 @@ internal static class Program
             if (!checker.Available) continue;
             checker.IsCorrect(lang == Lang.En ? "check" : "привіт"); // warm up: first call loads the dictionary
             spell[lang] = checker.IsCorrect;
+            checkers.Add(checker);
         }
         var detector = new LanguageDetector(spell);
         using var engine = new Engine(settings, detector, layouts);
+        engine.SpellCheckers.AddRange(checkers);
+        engine.CleanupLegacyExceptions();
         engine.Start();
 
         if (!File.Exists(Settings.FilePath)) settings.Save();

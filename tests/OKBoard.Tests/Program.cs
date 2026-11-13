@@ -27,6 +27,38 @@ if (args.Contains("--update-live"))
     return 0;
 }
 
+if (args.Contains("--why"))
+{
+    // Same detector setup as the app (Program.cs), with the user's real exceptions.
+    var spell = new Dictionary<Lang, Func<string, bool?>>();
+    foreach (var (lang, primary, tags) in new[] { (Lang.En, "en", new[] { "en-US", "en-GB", "en-AU", "en-IE" }), (Lang.Ru, "ru", new[] { "ru-RU" }), (Lang.Uk, "uk", new[] { "uk-UA" }) })
+    {
+        var ch = SpellChecker.ForLanguage(primary, tags);
+        if (ch.Available) spell[lang] = ch.IsCorrect;
+    }
+    var user = Settings.Load();
+    var ex = new HashSet<string>(user.ExceptionWords, StringComparer.OrdinalIgnoreCase);
+    var d2 = new LanguageDetector(spell) { IsException = w => ex.Contains(w) };
+    var lm = new LayoutManager();
+    foreach (var w in args.SkipWhile(a => a != "--why").Skip(1))
+    {
+        var r = d2.AnalyzeBest(Keys(w), Lang.En, lm.Installed, Lang.Ru);
+        var r2 = d2.AnalyzeBest(Keys(w), Lang.Ru, lm.Installed, Lang.Ru);
+        Console.WriteLine($"{w}: from EN → {r.Convert} '{r.Alternative}' ({r.Reason}); from RU → {r2.Convert} '{r2.Alternative}' ({r2.Reason})");
+    }
+    return 0;
+}
+
+if (args.Contains("--probe"))
+{
+    int rcP = 1;
+    var tp = new Thread(() => rcP = E2E.Probe());
+    tp.SetApartmentState(ApartmentState.STA);
+    tp.Start();
+    tp.Join();
+    return rcP;
+}
+
 if (args.Contains("--e2e"))
 {
     int rc = 1;
@@ -123,26 +155,26 @@ foreach (var (typed, cur, expect) in cases)
 }
 
 // ── Broad sample: correct words must stay, wrong-layout words should be fixed ──
-string[] ruWords = ("обработка исключение пожалуйста завтрак холодильник отпуск бухгалтерия электричка воскресенье " +
+string[] corpusRu = ("обработка исключение пожалуйста завтрак холодильник отпуск бухгалтерия электричка воскресенье " +
     "здорово чувствую неважно презентация созвонимся уточнить релиз дедлайн фича баг коммит мерж " +
     "Москва Петербург Иван Наталья хорошего ладно щас норм ок спс кек").Split(' ');
-string[] enWords = ("breakfast refrigerator vacation accounting electricity sunday feeling presentation release " +
+string[] corpusEn = ("breakfast refrigerator vacation accounting electricity sunday feeling presentation release " +
     "deadline feature commit merge branch pipeline kubectl npm localhost json yaml docker async await " +
     "London Microsoft Google gonna wanna lol btw asap thx").Split(' ');
 int fpRu = 0, fpEn = 0, hitRu = 0, hitEn = 0;
-foreach (var w in ruWords)
+foreach (var w in corpusRu)
 {
     var keys = Keys(LayoutMap.ConvertText(w, Lang.Ru));
     var ok = det.Analyze(keys, Lang.Ru); if (ok.Convert) { fpRu++; Console.WriteLine($"  false positive RU: {w} → {ok.Alternative} ({ok.Reason})"); }
     var bad = det.Analyze(keys, Lang.En); if (bad.Convert) hitRu++; else Console.WriteLine($"  missed (typed in EN): {bad.Current} → {w} ({bad.Reason})");
 }
-foreach (var w in enWords)
+foreach (var w in corpusEn)
 {
     var keys = Keys(w);
     var ok = det.Analyze(keys, Lang.En); if (ok.Convert) { fpEn++; Console.WriteLine($"  false positive EN: {w} → {ok.Alternative} ({ok.Reason})"); }
     var bad = det.Analyze(keys, Lang.Ru); if (bad.Convert) hitEn++; else Console.WriteLine($"  missed (typed in RU): {bad.Current} → {w} ({bad.Reason})");
 }
-Console.WriteLine($"RU: {hitRu}/{ruWords.Length} fixed, {fpRu} false positives; EN: {hitEn}/{enWords.Length} fixed, {fpEn} false positives");
+Console.WriteLine($"RU: {hitRu}/{corpusRu.Length} fixed, {fpRu} false positives; EN: {hitEn}/{corpusEn.Length} fixed, {fpEn} false positives");
 Check("no false positives", fpRu + fpEn == 0);
 
 // ── Text tools ──
@@ -236,6 +268,86 @@ Check("snippet datetime", Snippets.Expand("{datetime}", fixedNow) == "03.11.2026
         var d = det.AnalyzeBest(Keys(k), cur, enRu);
         Check($"still fixed: {expect}", d.Convert && d.Alternative == expect, $"{d.Convert} '{d.Alternative}' ({d.Reason})");
     }
+}
+
+// ── User rules ──
+{
+    var errs = new List<string>();
+    var rules = RuleParser.Parse(new[]
+    {
+        "# comment", "# ofc = ru   commented-out example", "", "ofc = ru", "t:* = нет", "*.cs = no", "*abc* = да",
+        "/^[A-Z]{2,}-\\d+$/ = нет", "Code.exe: lerp = нет", "#if = нет", "bad line", "x = maybe", "/(/ = нет",
+    }, errs);
+    Check("rules: parsed count", rules.Count == 7, $"{rules.Count}: {string.Join(" | ", rules.Select(r => r.Source))}");
+    Check("rules: 3 errors", errs.Count == 3, string.Join(" | ", errs));
+    var ofc = rules.First(r => r.Pattern == "ofc");
+    Check("rules: word + target", ofc.Kind == RuleKind.Word && ofc.Action == RuleAction.Switch && ofc.Target == Lang.Ru && ofc.Matches("OFC"));
+    var tp = rules.First(r => r.Pattern == "t:");
+    Check("rules: prefix", tp.Kind == RuleKind.Prefix && tp.Action == RuleAction.Keep && tp.Matches("t:Prefab") && !tp.Matches("at:x"));
+    Check("rules: suffix", rules.First(r => r.Pattern == ".cs").Matches("Engine.cs"));
+    Check("rules: contains", rules.First(r => r.Pattern == "abc").Matches("xxABCyy"));
+    Check("rules: regex", rules.First(r => r.Kind == RuleKind.Regex).Matches("JIRA-123") && !rules.First(r => r.Kind == RuleKind.Regex).Matches("jira"));
+    var app = rules.First(r => r.Pattern == "lerp");
+    Check("rules: per app", app.AppliesTo("code.exe") && !app.AppliesTo("notepad.exe") && !app.AppliesTo(null));
+    Check("rules: '#if' is a rule, not a comment", rules.Any(r => r.Pattern == "#if"));
+    Check("short common words", det.IsShortCommon("я", Lang.Ru) && det.IsShortCommon("и", Lang.Ru) && !det.IsShortCommon("щъ", Lang.Ru));
+}
+
+// ── Active level: more corrections, but no false positives on real text ──
+{
+    Lang[] enRu = [Lang.En, Lang.Ru];
+    det.Level = Aggressiveness.Active;
+    (string keys, Lang cur, string expect)[] activeFix =
+    [
+        ("rfr", Lang.En, "как"), ("yflj", Lang.En, "надо"), ("dct", Lang.En, "все"), ("xnj", Lang.En, "что"),
+        ("ghbdtn", Lang.En, "привет"), ("cgc", Lang.En, "спс"), ("ujnjdj", Lang.En, "готово"), ("yjhv", Lang.En, "норм"),
+        ("ntrcn", Lang.En, "текст"), ("rjvvbn", Lang.En, "коммит"), ("ltgkjq", Lang.En, "деплой"),
+        ("ghbdtn", Lang.En, "привет"), ("руддщ", Lang.Ru, "hello"), ("ерфтлы", Lang.Ru, "thanks"), ("цщкл", Lang.Ru, "work"),
+    ];
+    foreach (var (k, cur, expect) in activeFix)
+    {
+        var keys = cur == Lang.Ru ? Keys(LayoutMap.ConvertText(k, Lang.Ru, Lang.En)) : Keys(k);
+        var d = det.AnalyzeBest(keys, cur, enRu);
+        Check($"active fixes {expect}", d.Convert && d.Alternative == expect, $"{d.Convert} '{d.Alternative}' ({d.Reason})");
+    }
+    // context: after a Russian word, a short word follows
+    var ctx = det.AnalyzeBest(Keys("ds"), Lang.En, enRu, context: Lang.Ru);
+    Check("context: ds → вы after Russian", ctx.Convert && ctx.Alternative == "вы", $"{ctx.Convert} '{ctx.Alternative}' {ctx.Reason}");
+    // while typing
+    var pre = det.AnalyzePrefix(Keys("ghbd"), Lang.En, enRu);
+    Check("prefix ghbd → прив", pre.Convert && pre.Alternative == "прив", $"{pre.Convert} '{pre.Alternative}'");
+    var pre2 = det.AnalyzePrefix(Keys("cgfc"), Lang.En, enRu);
+    Check("prefix cgfc → спас", pre2.Convert && pre2.Alternative == "спас", $"{pre2.Convert} '{pre2.Alternative}'");
+
+    // False positives: every word of the README (Russian) and of the sources (English) typed in its own layout.
+    string root = AppContext.BaseDirectory;
+    while (!File.Exists(Path.Combine(root, "README.md")) && Directory.GetParent(root) is { } up) root = up.FullName;
+    var readmeRu = System.Text.RegularExpressions.Regex.Matches(File.ReadAllText(Path.Combine(root, "README.md")), "[а-яё]{2,}",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+        .Select(m => m.Value).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    var enText = string.Join(" ", Directory.GetFiles(Path.Combine(root, "src"), "*.cs", SearchOption.AllDirectories).Select(File.ReadAllText));
+    var sourceEn = System.Text.RegularExpressions.Regex.Matches(enText, "[A-Za-z]{2,}").Select(m => m.Value)
+        .Distinct().ToList();
+    int fp = 0, fpPrefix = 0, n = 0;
+    var bad = new List<string>();
+    void Probe(string w, Lang cur)
+    {
+        var keys = cur == Lang.Ru ? Keys(LayoutMap.ConvertText(w, Lang.Ru, Lang.En)) : Keys(w);
+        n++;
+        var d = det.AnalyzeBest(keys, cur, enRu);
+        if (d.Convert) { fp++; if (bad.Count < 25) bad.Add($"{w}→{d.Alternative}"); }
+        for (int len = 4; len <= Math.Min(7, keys.Count); len++)
+        {
+            var p2 = det.AnalyzePrefix(keys.Take(len).ToList(), cur, enRu);
+            if (p2.Convert) { fpPrefix++; if (bad.Count < 25) bad.Add($"{w}[{len}]→{p2.Alternative}…"); break; }
+        }
+    }
+    foreach (var w in readmeRu) Probe(w, Lang.Ru);
+    foreach (var w in sourceEn) Probe(w, Lang.En);
+    Console.WriteLine($"  false-positive corpus: {n} words ({readmeRu.Count} RU, {sourceEn.Count} EN): whole-word {fp}, while-typing {fpPrefix}");
+    if (bad.Count > 0) Console.WriteLine("    " + string.Join(", ", bad));
+    Check("active: false positives on real text < 0.5%", fp + fpPrefix <= n / 200, $"{fp + fpPrefix} of {n}");
+    det.Level = Aggressiveness.Active;
 }
 
 // ── Updater: parsing GitHub's "latest release" ──

@@ -110,6 +110,8 @@ internal sealed class LayoutManager
 
     private readonly Dictionary<Lang, IntPtr> _hkl = new();
     private (Lang lang, long tick, IntPtr hwnd)? _pending;
+    /// <summary>When OKBoard itself last changed a layout (to tell it apart from the user doing it).</summary>
+    public long LastOwnSwitchTick { get; private set; }
 
     /// <summary>Supported layouts installed in Windows, in the order of the system language list.</summary>
     public List<Lang> Installed { get; } = [];
@@ -187,6 +189,7 @@ internal sealed class LayoutManager
         var hwnd = target ?? FocusWindow(out _);
         PostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, hkl);
         _pending = (lang, Environment.TickCount64, hwnd);
+        LastOwnSwitchTick = Environment.TickCount64;
     }
 
     public static bool IsPasswordField()

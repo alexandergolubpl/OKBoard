@@ -4,8 +4,9 @@ namespace OKBoard;
 
 internal sealed class SettingsForm : Form
 {
-    public const int LogTab = 5;
-    private const int ExceptionsTabIndex = 3;
+    public const int LogTab = 6;
+    public const int RulesTab = 2;
+    private const int ExceptionsTabIndex = 4;
 
     private readonly Settings _s;
     private readonly Engine _engine;
@@ -16,7 +17,7 @@ internal sealed class SettingsForm : Form
     private readonly List<(CheckBox box, Action<bool> set)> _checks = [];
     private readonly Dictionary<HotkeyAction, HotkeyBox> _hotkeyBoxes = new();
     private readonly FluentCheckBox _autostart = new() { Text = "Запускать вместе с Windows", AutoSize = true };
-    private readonly TextBox _apps = MultiLine(), _words = MultiLine(), _appLayouts = MultiLine();
+    private readonly TextBox _apps = MultiLine(), _words = MultiLine(), _appLayouts = MultiLine(), _rulesBox = MultiLine();
     private readonly ListView _log = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true };
 
     private static readonly Dictionary<HotkeyAction, string> HotkeyNames = new()
@@ -34,6 +35,7 @@ internal sealed class SettingsForm : Form
     private readonly Action _applyHistory;
     private readonly List<Snippet> _snips;
     private readonly NumericUpDown _historySize = new() { Minimum = 5, Maximum = 200, Width = 70 };
+    private readonly ComboBox _level = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 380 };
 
     public SettingsForm(Settings settings, Engine engine, Action applyHistory)
     {
@@ -53,7 +55,7 @@ internal sealed class SettingsForm : Form
         ShowInTaskbar = true;
         try { Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!); } catch { }
 
-        foreach (var page in new[] { GeneralTab(), HotkeysTab(), SnippetsTab(), ExceptionsTab(), AppLayoutsTab(), LogTabPage() })
+        foreach (var page in new[] { GeneralTab(), HotkeysTab(), RulesTabPage(), SnippetsTab(), ExceptionsTab(), AppLayoutsTab(), LogTabPage() })
         {
             _pages.Add(page);
             page.Visible = false;
@@ -168,9 +170,31 @@ internal sealed class SettingsForm : Form
         var page = new Page("Основные", Theme.GSettings);
         var p = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(0, 0, 0, 12) };
         AddCheck(p, "Автоматически исправлять слова, набранные не в той раскладке", "ghbdtn → привет, руддщ → hello. Срабатывает на пробеле/Enter и только когда уверен: слово должно быть в словаре Windows.", _s.AutoSwitch, v => _s.AutoSwitch = v);
-        AddCheck(p, "Отменять автоисправление клавишей Backspace", "Сразу после исправления Backspace вернёт исходное слово и раскладку.", _s.UndoWithBackspace, v => _s.UndoWithBackspace = v);
+        AddCheck(p, "Отменять автоисправление клавишей Backspace", "В течение 3 секунд после исправления Backspace вернёт исходное слово и раскладку.", _s.UndoWithBackspace, v => _s.UndoWithBackspace = v);
         AddCheck(p, "Запоминать отменённые исправления как исключения", "Если исправление одного и того же слова отменить дважды (Backspace сразу после исправления или Pause), " +
             "слово больше не будет исправляться. Список и удаление — на вкладке «Исключения».", _s.LearnFromUndo, v => _s.LearnFromUndo = v);
+        var levelRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 4, 3, 2) };
+        levelRow.Controls.Add(new Label { Text = "Активность:", AutoSize = true, Margin = new Padding(3, 7, 6, 3) });
+        _level.Items.AddRange(["Осторожно — только словарные слова", "Обычно", "Активно — как Caramba и Ninja (рекомендуется)"]);
+        _level.SelectedIndex = Math.Clamp(_s.Aggressiveness, 0, 2);
+        levelRow.Controls.Add(_level);
+        p.Controls.Add(levelRow);
+        p.Controls.Add(Hint("Активно: исправляются и трёхбуквенные слова, и одиночное слово перед Enter (если получается " +
+                            "настоящее слово), учитывается язык предыдущего слова фразы."));
+        AddCheck(p, "Исправлять уже во время набора (активный режим)",
+            "Как только по первым 4–7 буквам ясно, что это начало частого слова в другой раскладке (ghbd → прив…), " +
+            "набранное переводится и раскладка переключается — остальное слово вы печатаете уже правильно.",
+            _s.SwitchWhileTyping, v => _s.SwitchWhileTyping = v);
+        AddCheck(p, "Не исправлять слово, если раскладку только что переключили вручную",
+            "Переключили сами (Alt+Shift, Win+Пробел) — значит, знаете, что печатаете: следующее слово не трогается.",
+            _s.TrustManualSwitch, v => _s.TrustManualSwitch = v);
+        AddCheck(p, "Исправлять и короткое слово перед исправленным (z ndjq → я твой)",
+            "Одно-трёхбуквенные слова сами по себе не исправляются (слишком мало букв), а вместе со следующим словом — да.",
+            _s.FixShortWordBefore, v => _s.FixShortWordBefore = v);
+        AddCheck(p, "Учиться на исправлениях вручную (Pause)",
+            "Исправили вручную слово из исключений — оно убирается из исключений. Исправили одно и то же слово дважды — " +
+            "появляется правило всегда его исправлять.",
+            _s.LearnFromManual, v => _s.LearnFromManual = v);
         AddCheck(p, "Исправлять случайно нажатый Caps Lock (пРИВЕТ → Привет)", null, _s.FixCapsLockAccident, v => _s.FixCapsLockAccident = v);
         AddCheck(p, "Исправлять ДВе заглавные буквы в начале слова", null, _s.FixDoubleCapital, v => _s.FixDoubleCapital = v);
         AddCheck(p, "Двойное нажатие Shift исправляет последнее слово", "Удобно на ноутбуках без клавиши Pause/Break.", _s.DoubleShiftConverts, v => _s.DoubleShiftConverts = v);
@@ -367,6 +391,39 @@ internal sealed class SettingsForm : Form
         return page;
     }
 
+    private Page RulesTabPage()
+    {
+        var page = new Page("Правила", Theme.GRules);
+        var t = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, Padding = new Padding(0, 0, 0, 8) };
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        var help = new Label { AutoSize = true, MaximumSize = new Size(760, 0), Margin = new Padding(3, 0, 3, 10), Text = RuleParser.Help };
+        t.Controls.Add(help);
+        _rulesBox.Text = string.Join(Environment.NewLine, _s.Rules);
+        t.Controls.Add(_rulesBox);
+        var status = new Label { AutoSize = true, Tag = "hint", MaximumSize = new Size(760, 0), Margin = new Padding(3, 8, 3, 3) };
+        void Validate()
+        {
+            var errors = new List<string>();
+            var n = RuleParser.Parse(_rulesBox.Lines, errors).Count;
+            status.Text = errors.Count == 0
+                ? $"Правил: {n}. Порядок проверки: правила «нет» → правила «да» → исключения → словарь."
+                : $"Правил: {n}. Не понятно ({errors.Count}): " + string.Join("; ", errors.Take(3));
+        }
+        _rulesBox.TextChanged += (_, _) => Validate();
+        Validate();
+        t.Controls.Add(status);
+        t.Resize += (_, _) =>
+        {
+            var w = new Size(Math.Max(200, t.ClientSize.Width - t.LogicalToDeviceUnits(12)), 0);
+            help.MaximumSize = w;
+            status.MaximumSize = w;
+        };
+        page.Controls.Add(t);
+        return page;
+    }
+
     private Page AppLayoutsTab()
     {
         var page = new Page("Раскладка приложений", Theme.GApps);
@@ -453,6 +510,8 @@ internal sealed class SettingsForm : Form
             if (parts.Length == 2 && Settings.ParseLang(parts[1]) is { } lang) _s.AppLayouts[parts[0]] = lang.ToString().ToLowerInvariant();
         }
         _s.ClipboardHistorySize = (int)_historySize.Value;
+        _s.Aggressiveness = _level.SelectedIndex;
+        _s.Rules = _rulesBox.Lines.Select(l => l.TrimEnd()).Where(l => l.Length > 0).ToList();
         _s.Snippets = _snips
             .Where(x => !string.IsNullOrWhiteSpace(x.Abbr) && x.Text.Length > 0)
             .GroupBy(x => x.Abbr.Trim(), StringComparer.OrdinalIgnoreCase)

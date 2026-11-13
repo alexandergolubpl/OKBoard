@@ -31,6 +31,20 @@ internal sealed class Engine : IDisposable
     private Lang? _wordStartLang;
     private Lang? _lastCyrillic;
     private AutoFix? _lastAuto;
+    private List<SwitchRule> _rules = [];
+    private Lang? _prevWordLang;      // layout the previous word of this line ended up in
+    private bool _midWordTried;       // the while-typing check already ran (and converted or not) for this word
+    private bool _midWordFixed;       // ...and converted it: the word is settled, don't second-guess it at the space
+    private Lang? _lastLangSeen;
+    private long _userSwitchTick = long.MinValue / 2, _wordStartTick;
+    private readonly Dictionary<string, int> _manualCounts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Queue<(DateTime time, string reason, bool converted)> _decisions = new();
+    private long _lastSelfTest = Environment.TickCount64, _lastStatsLog = Environment.TickCount64;
+
+    /// <summary>OS spell checkers, for the periodic self-test and diagnostics.</summary>
+    public List<SpellChecker> SpellCheckers { get; } = [];
+    /// <summary>Message to show once at start-up (e.g. what the legacy cleanup removed).</summary>
+    public string? StartupNotice { get; private set; }
     private readonly Dictionary<string, int> _undoCounts = new(StringComparer.OrdinalIgnoreCase);
     private const int UndoWindowMs = 3000, UndoesToLearn = 2;
     private ManualCycle? _cycle;
@@ -161,6 +175,17 @@ internal sealed class Engine : IDisposable
     /// </summary>
     public void CheckHookHealth()
     {
+        var nowTick = Environment.TickCount64;
+        if (nowTick - _lastSelfTest > 10 * 60_000)
+        {
+            _lastSelfTest = nowTick;
+            foreach (var sc in SpellCheckers) sc.SelfTest();
+        }
+        if (nowTick - _lastStatsLog > 60 * 60_000)
+        {
+            _lastStatsLog = nowTick;
+            Trace?.Invoke("last hour: " + string.Join("; ", DecisionSummary(TimeSpan.FromHours(1))).Replace("  ", ""));
+        }
         // 1) Keys the witness hook (own thread) counted since the main hook last saw one. The witness is called
         //    after the main hook, so a healthy main hook keeps this at 0..1; require it on two checks in a row.
         long missed = _witness is { Active: true } w ? w.KeyDowns - _witnessAtLastKey : 0;
@@ -225,6 +250,48 @@ internal sealed class Engine : IDisposable
         _snippets.Clear();
         foreach (var sn in _s.Snippets)
             if (!string.IsNullOrWhiteSpace(sn.Abbr) && !string.IsNullOrEmpty(sn.Text)) _snippets.TryAdd(sn.Abbr.Trim(), sn);
+        _rules = RuleParser.Parse(_s.Rules);
+        _detector.Level = (Aggressiveness)Math.Clamp(_s.Aggressiveness, 0, 2);
+    }
+
+    /// <summary>
+    /// Versions before 0.2.3 added a word to the exceptions after a single Backspace undo, so the list filled up
+    /// with everyday words typed in the wrong layout ("ghbdtn" = привет). Remove, once, the entries whose
+    /// conversion is a real word while they themselves are not — keeping a copy in the settings.
+    /// </summary>
+    public void CleanupLegacyExceptions()
+    {
+        if (_s.LegacyExceptionsCleaned) return;
+        var removed = new List<string>();
+        foreach (var w in _s.ExceptionWords.ToList())
+        {
+            var script = LayoutMap.DetectScript(w, PreferredCyrillic());
+            if (script == null) continue;
+            var from = script.Value;
+            var to = LayoutMap.IsCyrillicLang(from) ? Lang.En : PreferredCyrillic();
+            var alt = LayoutMap.ConvertText(w, from, to);
+            if (!_detector.IsValid(w, from) && _detector.IsValid(LanguageDetector.Core(alt, to), to))
+                removed.Add(w);
+        }
+        _s.LegacyExceptionsCleaned = true;
+        if (removed.Count > 0)
+        {
+            _s.ExceptionWords.RemoveAll(w => removed.Contains(w));
+            _s.RemovedLegacyExceptions = removed;
+            StartupNotice = $"Убраны ошибочно выученные исключения ({removed.Count}): {string.Join(", ", removed.Take(8))}" +
+                            (removed.Count > 8 ? "…" : "") + ". Если какое-то нужно, добавьте его снова в настройках.";
+            Trace?.Invoke($"legacy exceptions removed: {removed.Count}");
+        }
+        try { _s.Save(); } catch { }
+        ReloadSettings();
+    }
+
+    public void RemoveException(string word)
+    {
+        word = word.Trim().ToLowerInvariant();
+        if (!_exceptions.Remove(word)) return;
+        _s.ExceptionWords.RemoveAll(w => w.Equals(word, StringComparison.OrdinalIgnoreCase));
+        SaveSoon();
     }
 
     // ───────────────────────────── public commands (tray menu etc.) ─────────────────────────────
@@ -322,6 +389,7 @@ internal sealed class Engine : IDisposable
     private void ForegroundProc(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
     {
         ResetLine();
+        _lastLangSeen = null; // another window has its own layout: not a manual switch
         var name = GetProcessName(hwnd);
         if (name != null && _s.AppLayouts.TryGetValue(name, out var l) && Settings.ParseLang(l) is { } lang)
         {
@@ -436,11 +504,19 @@ internal sealed class Engine : IDisposable
             if (WordRange().count == 0)
             {
                 _wordStartLang = _layouts.Current();
+                _wordStartTick = Environment.TickCount64;
+                _midWordTried = false;
+                _midWordFixed = false;
+                // The layout changed since the last word and it wasn't us: the user switched it by hand.
+                if (_lastLangSeen != null && _wordStartLang != null && _wordStartLang != _lastLangSeen &&
+                    Environment.TickCount64 - _layouts.LastOwnSwitchTick > 1500)
+                    _userSwitchTick = Environment.TickCount64;
+                if (_wordStartLang != null) _lastLangSeen = _wordStartLang;
                 if (_wordStartLang is { } l && LayoutMap.IsCyrillicLang(l)) _lastCyrillic = l;
             }
             _line.Add(new KeyStroke(vk, ShiftHeld, CapsOn));
             if (_line.Count > 400) _line.RemoveRange(0, 200);
-            return false;
+            return TryFixWhileTyping();
         }
 
         ResetLine(); // arrows, Home/End, Delete, Esc, F-keys, numpad...
@@ -474,6 +550,7 @@ internal sealed class Engine : IDisposable
 
     private void ResetLine()
     {
+        _prevWordLang = null;
         _line.Clear();
         _lastAuto = null;
         _cycle = null;
@@ -543,6 +620,8 @@ internal sealed class Engine : IDisposable
         var sb = new System.Text.StringBuilder(64);
         GetClassName(fg, sb, sb.Capacity);
         if (sb.ToString() is "Progman" or "WorkerW" or "Shell_TrayWnd") return false; // the desktop itself
+        // Maximized windows also cover the whole monitor when the taskbar auto-hides: they are not "full-screen".
+        if (((long)GetWindowLongPtr(fg, -16 /* GWL_STYLE */) & 0x01000000 /* WS_MAXIMIZE */) != 0) return false;
         var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
         if (!GetMonitorInfo(MonitorFromWindow(fg, 2 /* NEAREST */), ref mi)) return false;
         return r.Left <= mi.rcMonitor.Left && r.Top <= mi.rcMonitor.Top && r.Right >= mi.rcMonitor.Right && r.Bottom >= mi.rcMonitor.Bottom;
@@ -568,7 +647,11 @@ internal sealed class Engine : IDisposable
             $"Удерживаемые модификаторы (по данным программы): {(_held.Count == 0 ? "нет" : string.Join(", ", _held.Select(v => $"0x{v:X2}")))}",
             $"Раскладка сейчас: {CurrentLang?.ToString() ?? "не распознана"}; установлены: {string.Join(", ", _layouts.Installed)}",
             $"Словари: {string.Join(", ", new[] { Lang.En, Lang.Ru, Lang.Uk }.Where(_layouts.Has).Select(l => $"{l}={(_detector.HasDictionary(l) ? "есть" : "нет")}"))}",
+            $"Проверка словарей Windows: {(SpellCheckers.Count == 0 ? "—" : string.Join(", ", SpellCheckers.Select(sc => $"{sc.Tag} {(sc.LastSelfTestOk ? "ok" : "СБОЙ")} (ошибок {sc.Failures}, пересоздан {sc.Recreated})")))}",
+            $"Правил: {_rules.Count}",
+            "Решения за последний час:",
         };
+        lines.AddRange(DecisionSummary(TimeSpan.FromHours(1)).Select(l => "  " + l));
         return string.Join(Environment.NewLine, lines);
     }
 
@@ -582,10 +665,25 @@ internal sealed class Engine : IDisposable
         // A single token followed by Enter/Tab is how passwords and logins are typed (browsers don't expose
         // password fields to us). Never rewrite it — the user can still press the hotkey manually.
         bool singleTokenSubmit = vk != VK_SPACE && _s.SkipSingleWordBeforeEnter && start == 0;
-        if (count > 0 && !singleTokenSubmit && AutoAllowed() && _layouts.Current() is { } cur && (_wordStartLang == null || _wordStartLang == cur))
+        var why = count == 0 ? null
+            : singleTokenSubmit && _detector.Level == Aggressiveness.Careful ? "одно слово перед Enter/Tab"
+            : _midWordFixed ? "исправлено во время набора"
+            : WhyNotAuto() is { } w ? w
+            : _layouts.Current() is not { } c0 ? "раскладка не распознана"
+            : _wordStartLang != null && _wordStartLang != c0 ? "раскладку сменили посреди слова"
+            : _s.TrustManualSwitch && _wordStartTick - _userSwitchTick < 5000 && _userSwitchTick > _layouts.LastOwnSwitchTick
+                ? "раскладку только что переключили вручную"
+            : null;
+        if (count > 0 && why != null) NoteDecision(why, false);
+        if (count > 0 && why == null && _layouts.Current() is { } cur)
         {
             var word = _line.GetRange(start, count);
-            var d = _detector.AnalyzeBest(word, cur, _layouts.Installed, PreferredCyrillic());
+            var context = _prevWordLang is { } pl && pl != cur ? pl : (Lang?)null;
+            var d = ApplyRules(word, cur) ?? _detector.AnalyzeBest(word, cur, _layouts.Installed, PreferredCyrillic(), context);
+            // A lone word followed by Enter/Tab may be a password: convert it only into a real dictionary/common word.
+            if (singleTokenSubmit && d.Convert && d.Strength < 2)
+                d = d with { Convert = false, Reason = "одно слово перед Enter/Tab, нет уверенности" };
+            NoteDecision(d.Reason, d.Convert);
             var newKeys = word;
             var renderLang = cur;
             var kinds = new List<string>();
@@ -612,6 +710,18 @@ internal sealed class Engine : IDisposable
             }
             var newText = LayoutMap.Render(newKeys, renderLang);
             var oldText = LayoutMap.Render(word, cur);
+            // "z ndjq" → "я твой": a short word just before the corrected one was typed in the same wrong layout
+            var prev = d.Convert ? ShortWordBefore(start, cur, renderLang) : null;
+            if (prev is { } pw)
+            {
+                word = [.. _line.GetRange(pw.start, start - pw.start), .. word];
+                newKeys = [.. _line.GetRange(pw.start, start - pw.start), .. newKeys];
+                count += start - pw.start;
+                start = pw.start;
+                newText = LayoutMap.Render(newKeys, renderLang);
+                oldText = LayoutMap.Render(word, cur);
+                kinds.Add("короткое слово перед ним");
+            }
             if (newText != oldText)
             {
                 InputSender.ReleaseModifiers(_held.Where(v => v is 0xA0 or 0xA1));
@@ -630,10 +740,114 @@ internal sealed class Engine : IDisposable
                 if (_s.SoundOnAutoSwitch) Task.Run(() => Console.Beep(1400, 25));
             }
         }
+        if (count > 0) _prevWordLang = _layouts.Current();
         _wordStartLang = null;
         if (vk == VK_SPACE) _line.Add(new KeyStroke(VK_SPACE, false));
         else { var keep = _lastAuto; ResetLine(); _lastAuto = keep; }
         return swallow;
+    }
+
+    /// <summary>
+    /// Caramba-style: once the first 4–7 letters can't start a word of this layout but start a common word of the
+    /// other one, retype them in the other layout and switch, so the rest of the word is typed right.
+    /// </summary>
+    /// <returns>true to swallow the current key (it is retyped together with the converted start).</returns>
+    private bool TryFixWhileTyping()
+    {
+        if (_midWordTried || !_s.SwitchWhileTyping || _detector.Level != Aggressiveness.Active) return false;
+        var (start, count) = WordRange();
+        if (count < 4) return false;
+        if (count > 7) { _midWordTried = true; return false; }
+        if (_layouts.Current() is not { } cur || (_wordStartLang != null && _wordStartLang != cur)) return false;
+        if (WhyNotAuto() != null || IsSuspended) return false;
+        if (_s.TrustManualSwitch && _wordStartTick - _userSwitchTick < 5000 && _userSwitchTick > _layouts.LastOwnSwitchTick) return false;
+        var keys = _line.GetRange(start, count);
+        var rule = ApplyRules(keys, cur);
+        if (rule is { Convert: false }) { _midWordTried = true; return false; }
+        var d = _detector.AnalyzePrefix(keys, cur, _layouts.Installed, PreferredCyrillic());
+        if (!d.Convert) return false;
+        _midWordTried = true;
+        _midWordFixed = true;
+        var newText = LayoutMap.Render(keys, d.Target);
+        InputSender.ReleaseModifiers(_held.Where(v => v is 0xA0 or 0xA1));
+        InputSender.Backspace(count - 1);   // the current key hasn't reached the app yet: we swallow it
+        InputSender.Text(newText);
+        _layouts.Switch(d.Target);
+        _wordStartLang = d.Target;
+        _lastLangSeen = d.Target;
+        if (LayoutMap.IsCyrillicLang(d.Target)) _lastCyrillic = d.Target;
+        NoteDecision("во время набора: " + d.Reason, true);
+        AddLog(d.Current + "…", newText + "…", "во время набора");
+        if (_s.SoundOnAutoSwitch) Task.Run(() => Console.Beep(1400, 25));
+        return true;
+    }
+
+    /// <summary>Why auto-correction is off right now (null = it is on).</summary>
+    private string? WhyNotAuto() =>
+        !_s.AutoSwitch ? "автопереключение выключено"
+        : IsDnd ? "режим «Не беспокоить»"
+        : IsExcludedApp(ForegroundProcess()) ? "приложение в исключениях"
+        : InPasswordField() ? "поле пароля"
+        : null;
+
+    /// <summary>User rules: "нет" wins over "да"; both win over the dictionary and the exceptions.</summary>
+    private Decision? ApplyRules(List<KeyStroke> word, Lang cur)
+    {
+        if (_rules.Count == 0) return null;
+        var app = ForegroundProcess();
+        var curText = LayoutMap.Render(word, cur);
+        var renders = _layouts.Installed.Select(l => (lang: l, text: LayoutMap.Render(word, l))).ToList();
+        bool Hit(SwitchRule r, string t) => r.Matches(t) || r.Matches(LanguageDetector.Core(t, LayoutMap.DetectScript(t) ?? cur));
+        var applicable = _rules.Where(r => r.AppliesTo(app)).ToList();
+        if (applicable.Any(r => r.Action == RuleAction.Keep && renders.Any(x => Hit(r, x.text))))
+            return new Decision(false, "правило: не трогать", curText, "", cur);
+        foreach (var r in applicable.Where(r => r.Action == RuleAction.Switch))
+        {
+            foreach (var (l, text) in renders)
+            {
+                if (l == cur || (r.Target is { } t && t != l)) continue;
+                if (Hit(r, text) || Hit(r, curText))
+                    return new Decision(true, "правило: исправлять", curText, text, l, 9);
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// A 1–3 letter word right before position <paramref name="start"/> (one space between) that isn't a word
+    /// in the current layout but is a common short word in the target one ("z" → "я", "b" → "и").
+    /// </summary>
+    private (int start, int count)? ShortWordBefore(int start, Lang cur, Lang target)
+    {
+        if (!_s.FixShortWordBefore || LayoutMap.IsCyrillicLang(cur) == LayoutMap.IsCyrillicLang(target)) return null;
+        if (start < 2 || !_line[start - 1].IsSpace || _line[start - 2].IsSpace) return null;
+        int end = start - 1, s = end;
+        while (s > 0 && !_line[s - 1].IsSpace) s--;
+        int n = end - s;
+        if (n is < 1 or > 3) return null;
+        var keys = _line.GetRange(s, n);
+        var curText = LanguageDetector.Core(LayoutMap.Render(keys, cur), cur);
+        var tText = LanguageDetector.Core(LayoutMap.Render(keys, target), target);
+        if (curText.Length == 0 || tText.Length == 0 || _detector.IsValid(curText, cur) || IsExceptionWord(curText)) return null;
+        return _detector.IsShortCommon(tText, target) ? (s, n) : null;
+    }
+
+    private bool IsExceptionWord(string w) => _exceptions.Contains(w.ToLowerInvariant());
+
+    private void NoteDecision(string reason, bool converted)
+    {
+        _decisions.Enqueue((DateTime.Now, reason, converted));
+        while (_decisions.Count > 500) _decisions.Dequeue();
+    }
+
+    /// <summary>Last hour of decisions as "reason: count" lines (no typed text, only why).</summary>
+    private List<string> DecisionSummary(TimeSpan window)
+    {
+        var since = DateTime.Now - window;
+        var recent = _decisions.Where(x => x.time >= since).ToList();
+        var lines = new List<string> { $"слов: {recent.Count}, исправлено: {recent.Count(x => x.converted)}" };
+        lines.AddRange(recent.GroupBy(x => x.reason).OrderByDescending(g => g.Count()).Take(8).Select(g => $"  {g.Key}: {g.Count()}"));
+        return lines;
     }
 
     /// <summary>Abbreviation typed in any installed layout (so "мк" works even if typed as "vr").</summary>
@@ -717,6 +931,33 @@ internal sealed class Engine : IDisposable
         if (a.Switched && _s.LearnFromUndo && LearnFromUndo(LanguageDetector.Core(a.Original, a.From)))
             AddLog(a.Converted, a.Original, "отмена → в исключения");
         else AddLog(a.Converted, a.Original, "отмена");
+    }
+
+    /// <summary>
+    /// The user fixed a word by hand (Pause) that we left alone. If it is in the exceptions, that exception was
+    /// wrong: drop it now. After the second manual fix of the same word, add a rule to always correct it.
+    /// </summary>
+    private void LearnFromManual(string word, Lang target)
+    {
+        word = word.Trim().ToLowerInvariant();
+        if (word.Length == 0) return;
+        if (IsExceptionWord(word))
+        {
+            RemoveException(word);
+            Notify?.Invoke($"«{word}» убрано из исключений: вы исправили его вручную");
+            return;
+        }
+        if (word.Length < 2) return;
+        int n = _manualCounts.GetValueOrDefault(word) + 1;
+        _manualCounts[word] = n;
+        if (n < 2) return;
+        _manualCounts.Remove(word);
+        var line = $"{word} = {target.ToString().ToLowerInvariant()}";
+        if (_s.Rules.Any(r => r.Trim().Equals(line, StringComparison.OrdinalIgnoreCase))) return;
+        _s.Rules.Add(line);
+        _rules = RuleParser.Parse(_s.Rules);
+        SaveSoon();
+        Notify?.Invoke($"Новое правило «{line}»: вы дважды исправили это слово вручную. Правила — в настройках.");
     }
 
     /// <summary>
@@ -879,8 +1120,11 @@ internal sealed class Engine : IDisposable
         var after = LayoutMap.Render(keys, target);
 
         // Converting back a word we auto-corrected a moment ago means the detector was wrong: learn from it.
+        bool wasAuto = _lastAuto is { Switched: true, IsSnippet: false };
         if (!phrase && _lastAuto is { Switched: true, IsSnippet: false } a && _s.LearnFromUndo)
             LearnFromUndo(LanguageDetector.Core(a.Original, a.From));
+        else if (!phrase && !wasAuto && _s.LearnFromManual && _cycle is { Index: 0 })
+            LearnFromManual(LanguageDetector.Core(before, cur), target);
         _lastAuto = null;
 
         InputSender.ReleaseModifiers(_held);

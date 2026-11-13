@@ -25,9 +25,10 @@ internal sealed class BigramModel
         }
     }
 
-    public (double avg, int unseen) Score(string word)
+    /// <param name="prefix">Score the start of a word being typed: no end-of-word marker.</param>
+    public (double avg, int unseen) Score(string word, bool prefix = false)
     {
-        var s = "^" + word.ToLowerInvariant() + "$";
+        var s = "^" + word.ToLowerInvariant() + (prefix ? "" : "$");
         double sum = 0;
         int unseen = 0, n = 0;
         for (int i = 0; i + 1 < s.Length; i++, n++)
@@ -40,10 +41,17 @@ internal sealed class BigramModel
     }
 }
 
+/// <summary>How eagerly words are corrected.</summary>
+public enum Aggressiveness { Careful = 0, Normal = 1, Active = 2 }
+
 /// <summary>Decides whether a just-typed word was entered in the wrong keyboard layout.</summary>
 public sealed class LanguageDetector
 {
-    private sealed record LangData(Func<string, bool?>? Spell, HashSet<string> Common, HashSet<string> Short, BigramModel Model);
+    private sealed record LangData(Func<string, bool?>? Spell, HashSet<string> Common, HashSet<string> Short, BigramModel Model,
+        HashSet<string> Prefixes);
+
+    /// <summary>Active (default): 3-letter words by dictionary, softer statistics, prefixes while typing.</summary>
+    public Aggressiveness Level { get; set; } = Aggressiveness.Active;
 
     private readonly Dictionary<Lang, LangData> _data = new();
 
@@ -53,8 +61,8 @@ public sealed class LanguageDetector
     /// <param name="spell">OS spell checkers per language; a missing entry means "no dictionary for that language".</param>
     public LanguageDetector(IReadOnlyDictionary<Lang, Func<string, bool?>> spell)
     {
-        Add(Lang.En, spell, WordData.En, WordData.En2);
-        Add(Lang.Ru, spell, WordData.Ru, WordData.Ru2);
+        Add(Lang.En, spell, WordData.En + "\n" + WordData.EnMore, WordData.En2);
+        Add(Lang.Ru, spell, WordData.Ru + "\n" + WordData.RuMore, WordData.Ru2);
         Add(Lang.Uk, spell, WordData.Uk, WordData.Uk2);
     }
 
@@ -66,13 +74,21 @@ public sealed class LanguageDetector
     {
         var common = Split(words);
         common.UnionWith(shortWords);
-        _data[l] = new LangData(spell.GetValueOrDefault(l), common, shortWords, new BigramModel(common));
+        // Word starts (4..7 letters) of the common words: "прив", "приве"... for correcting while typing.
+        var prefixes = new HashSet<string>();
+        foreach (var w in common)
+            for (int n = 4; n <= Math.Min(7, w.Length); n++) prefixes.Add(w[..n]);
+        _data[l] = new LangData(spell.GetValueOrDefault(l), common, shortWords, new BigramModel(common), prefixes);
     }
 
     private static HashSet<string> Split(string s) =>
         s.Split([' ', '\n', '\r', '\t'], StringSplitOptions.RemoveEmptyEntries).Select(w => w.ToLowerInvariant()).ToHashSet();
 
     public bool HasDictionary(Lang l) => _data[l].Spell != null;
+
+    /// <summary>A short everyday word of the language (curated list), e.g. "я", "и", "the".</summary>
+    public bool IsShortCommon(string word, Lang l) =>
+        word.Length > 0 && (_data[l].Short.Contains(word.ToLowerInvariant()) || (word.Length <= 3 && _data[l].Common.Contains(word.ToLowerInvariant())));
 
     /// <summary>Strip non-letters at both ends.</summary>
     internal static string Core(string s, Lang l)
@@ -110,13 +126,15 @@ public sealed class LanguageDetector
     /// Only Latin↔Cyrillic pairs are auto-corrected: Russian and Ukrainian share too many letters for that to be safe.
     /// When several Cyrillic layouts qualify, the strongest evidence wins, ties go to <paramref name="preferred"/>.
     /// </summary>
-    public Decision AnalyzeBest(IReadOnlyList<KeyStroke> keys, Lang current, IEnumerable<Lang> candidates, Lang? preferred = null)
+    /// <param name="context">Language of the previous word in this line: the next word more likely continues in it.</param>
+    public Decision AnalyzeBest(IReadOnlyList<KeyStroke> keys, Lang current, IEnumerable<Lang> candidates, Lang? preferred = null,
+        Lang? context = null)
     {
         Decision? best = null;
         foreach (var target in candidates)
         {
             if (target == current || LayoutMap.IsCyrillicLang(target) == LayoutMap.IsCyrillicLang(current)) continue;
-            var d = Analyze(keys, current, target);
+            var d = Analyze(keys, current, target, context);
             if (!d.Convert) { best ??= d; continue; }
             if (best is not { Convert: true } || d.Strength > best.Strength || (d.Strength == best.Strength && target == preferred))
                 best = d;
@@ -127,8 +145,47 @@ public sealed class LanguageDetector
     public Decision Analyze(IReadOnlyList<KeyStroke> keys, Lang current) =>
         Analyze(keys, current, current == Lang.En ? Lang.Ru : Lang.En);
 
-    public Decision Analyze(IReadOnlyList<KeyStroke> keys, Lang current, Lang other)
+    /// <summary>
+    /// Correct while typing (as Caramba does): the first 4–7 letters can't start a word of the current language
+    /// but start a common word of the other one ("ghbd" → "прив" of привет). Active level only.
+    /// </summary>
+    public Decision AnalyzePrefix(IReadOnlyList<KeyStroke> keys, Lang current, IEnumerable<Lang> candidates, Lang? preferred = null)
     {
+        var none = new Decision(false, "prefix: no", LayoutMap.Render(keys, current), "");
+        if (Level != Aggressiveness.Active || keys.Count is < 4 or > 7) return none;
+        if (keys.Any(k => k.IsSpace || k.Vk is >= '0' and <= '9')) return none;
+        var cur = LayoutMap.Render(keys, current);
+        if (IsException(cur.ToLowerInvariant())) return none;
+        var cd = _data[current];
+        var curLower = cur.ToLowerInvariant();
+        if (cd.Prefixes.Contains(curLower) || cd.Common.Contains(curLower)) return none; // plausible start here
+        bool curBroken = IsBroken(cur, current);
+        // camelCase / acronyms in the current layout: an identifier, leave it
+        if (!curBroken && cur.Skip(1).Any(char.IsUpper)) return none;
+        if (!curBroken && cd.Spell != null && cd.Spell(curLower) == true) return none;
+        var (_, cUnseen) = cd.Model.Score(curLower, prefix: true);
+        if (!curBroken && cUnseen < 2) return none;
+        Decision? best = null;
+        foreach (var target in candidates)
+        {
+            if (target == current || LayoutMap.IsCyrillicLang(target) == LayoutMap.IsCyrillicLang(current)) continue;
+            var alt = LayoutMap.Render(keys, target);
+            var altLower = alt.ToLowerInvariant();
+            if (IsBroken(alt, target) || IsException(altLower)) continue;
+            if (alt.Skip(1).Any(char.IsUpper) && !alt.Skip(1).All(char.IsUpper)) continue;
+            var td = _data[target];
+            if (!td.Prefixes.Contains(altLower)) continue;
+            if (td.Model.Score(altLower, prefix: true).unseen > 0) continue;
+            var d = new Decision(true, "начало частого слова", cur, alt, target, 2);
+            if (best == null || target == preferred) best = d;
+        }
+        return best ?? none;
+    }
+
+    public Decision Analyze(IReadOnlyList<KeyStroke> keys, Lang current, Lang other, Lang? context = null)
+    {
+        bool active = Level == Aggressiveness.Active, careful = Level == Aggressiveness.Careful;
+        bool inContext = context == other; // the previous word of the line is already in the other language
         var cur = LayoutMap.Render(keys, current);
         var alt = LayoutMap.Render(keys, other);
         Decision No(string why) => new(false, why, cur, alt, other);
@@ -147,6 +204,16 @@ public sealed class LanguageDetector
             return No("exception");
 
         bool curBroken = curCore.Length == 0 || IsBroken(curCore, current);
+
+        // "yyyy" → "нннн": the same letter three times in a row is a placeholder or a key held down, not a word.
+        for (int i = 2; i < altCore.Length; i++)
+            if (char.ToLowerInvariant(altCore[i]) == char.ToLowerInvariant(altCore[i - 1]) &&
+                char.ToLowerInvariant(altCore[i]) == char.ToLowerInvariant(altCore[i - 2])) return No("repeated letter");
+
+        // Phrase context: after a Russian word, "vs" is "мы" even though "vs" is also an English abbreviation.
+        if (inContext && Level != Aggressiveness.Careful && altCore.Length <= 3 && !IsBroken(altCore, other) &&
+            _data[other].Short.Contains(altCore.ToLowerInvariant()) && !_data[current].Short.Contains(curCore.ToLowerInvariant()))
+            return Yes("short word, phrase context", 2);
         if (!curBroken)
         {
             // camelCase / PascalCase identifiers in the current layout: leave alone
@@ -172,19 +239,30 @@ public sealed class LanguageDetector
 
         var od = _data[other];
         if (altCore.Length == 2)
-            return od.Short.Contains(altCore.ToLowerInvariant()) ? Yes("short common word", 2) : No("short");
+        {
+            if (od.Short.Contains(altCore.ToLowerInvariant())) return Yes("short common word", 2);
+            if (inContext && !careful && od.Common.Contains(altCore.ToLowerInvariant())) return Yes("short word, phrase context", 2);
+            return No("short");
+        }
 
         if (altCore.Length == 3 && !curBroken)
         {
-            // Spell checkers accept lots of 3-letter abbreviations (щас → "ofc"): trust only the curated list.
-            return od.Common.Contains(altCore.ToLowerInvariant()) ? Yes("common word", 2) : No("short, not common");
+            if (od.Common.Contains(altCore.ToLowerInvariant())) return Yes("common word", 2);
+            // Spell checkers accept lots of 3-letter abbreviations (щас → "ofc"), so the dictionary decides only when
+            // the typed letters don't even look like the current language (or the phrase is already in the other one).
+            if (!careful && (active || inContext) && IsValid(altCore, other))
+            {
+                var (_, u) = _data[current].Model.Score(curCore);
+                if (u >= 2 || inContext) return Yes("dictionary (3 letters)", 2);
+            }
+            return No("short, not common");
         }
 
         if (od.Common.Contains(altCore.ToLowerInvariant())) return Yes("common word", 2);
         if (IsValid(altCore, other)) return Yes("dictionary", 3);
 
-        // Neither form is in a dictionary: fall back to letter statistics, very conservatively.
-        if (altCore.Length >= 4)
+        // Neither form is in a dictionary: fall back to letter statistics.
+        if (altCore.Length >= 4 && !careful)
         {
             var (aAvg, aUnseen) = od.Model.Score(altCore);
             if (aUnseen == 0)
@@ -192,6 +270,7 @@ public sealed class LanguageDetector
                 if (curBroken) return Yes("statistics (current has punctuation inside)", 1);
                 var (cAvg, cUnseen) = _data[current].Model.Score(curCore);
                 if (cUnseen >= 2 && aAvg - cAvg > 1.5) return Yes("statistics", 1);
+                if ((active || inContext) && cUnseen >= 1 && aAvg - cAvg > 0.8) return Yes("statistics (active)", 1);
             }
         }
         return No("not sure");

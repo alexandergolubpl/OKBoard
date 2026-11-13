@@ -116,6 +116,10 @@ internal sealed class Updater : IDisposable
         }
         catch (Exception ex)
         {
+            // Don't hammer the network (a firewall blocking us would get a request every minute otherwise):
+            // try again in 2 hours.
+            _s.LastUpdateCheckUtc = DateTime.UtcNow - CheckEvery + TimeSpan.FromHours(2);
+            try { _s.Save(); } catch { }
             Engine.Trace?.Invoke("update check failed: " + ex.Message);
             if (manual) Notify?.Invoke("Не удалось проверить обновления: " + ex.Message);
         }

@@ -139,6 +139,7 @@ internal sealed class TrayApp : ApplicationContext
         _timer.Start();
         UpdateIcon(true);
 
+        if (_engine.StartupNotice is { } notice) ShowTip(notice);
         var current = Updater.Current.ToString(3);
         if (_settings.LastRunVersion != current)
         {

@@ -116,7 +116,8 @@ internal static class E2E
 
         Engine.Trace = m => Console.WriteLine("  trace: " + m);
         Settings.FilePath = Path.Combine(Path.GetTempPath(), "okboard-e2e-settings.json");
-        var settings = new Settings { PauseInFullscreen = false, SoundOnAutoSwitch = false };
+        // The classic tests below check corrections at the space; while-typing correction has its own section.
+        var settings = new Settings { PauseInFullscreen = false, SoundOnAutoSwitch = false, SwitchWhileTyping = false };
         var layouts = new LayoutManager();
         var ru = SpellChecker.ForLanguage("ru", "ru-RU");
         var en = SpellChecker.ForLanguage("en", "en-US", "en-GB");
@@ -227,8 +228,8 @@ internal static class E2E
 
         // 9c. lone word + Enter (password pattern) is not rewritten; with a space before it — it is
         Reset(); SetLang(Lang.En);
-        TypeKeys("ghbdtn"); Tap(0x0D); Pump(200);
-        Expect("single word + Enter untouched", tb.Text, "ghbdtn\r\n");
+        TypeKeys("cjkywt2"); Tap(0x0D); Pump(200);
+        Expect("single token with a digit + Enter untouched", tb.Text, "cjkywt2\r\n");
         Reset(); SetLang(Lang.En);
         TypeKeys("ok ghbdtn"); Tap(0x0D); Pump(200);
         Expect("sentence + Enter corrected", tb.Text, "ok привет\r\n");
@@ -301,6 +302,65 @@ internal static class E2E
         TypeKeys("Ghbdtn ");
         Expect("capitalised word keeps its case", tb.Text, "Привет ");
 
+        // 9i. user rules: "нет" keeps, "ru" forces, per word in any layout
+        settings.Rules = ["ofc = ru", "hello = нет"];
+        engine.ReloadSettings();
+        Reset(); SetLang(Lang.En);
+        TypeKeys("ok ofc ");
+        Expect("rule forces ofc → щас", tb.Text, "ok щас ");
+        Reset(); SetLang(Lang.Ru);
+        TypeKeys("lf hello ");
+        Expect("rule keeps руддщ", tb.Text, "да руддщ ");
+        settings.Rules = [];
+        engine.ReloadSettings();
+
+        // 9j. a short word before a corrected one follows it: "z ndjq" → "я твой"
+        Reset(); SetLang(Lang.En);
+        TypeKeys("z ndjq ");
+        Expect("short word before", tb.Text, "я твой ");
+        Reset(); SetLang(Lang.En);
+        TypeKeys("a ghbdtn ");
+        Expect("valid short word kept", tb.Text, "a привет ");
+
+        // 9k. the user switched the layout by hand: the next word is theirs, don't touch it
+        Reset(); SetLang(Lang.Ru);
+        TypeKeys("ckjdj ");
+        new LayoutManager().Switch(Lang.En, tb.Handle); Pump(1700); // a switch OKBoard didn't make
+        TypeKeys("ghbdtn ");
+        Expect("manual switch respected", tb.Text, "слово ghbdtn ");
+
+        // 9l. fixing an excepted word by hand removes the exception
+        engine.AddException("ntrcn"); Pump(100);
+        Reset(); SetLang(Lang.En);
+        TypeKeys("ok ntrcn ");
+        Expect("excepted word kept", tb.Text, "ok ntrcn ");
+        Tap(0x13); Pump(300);
+        Expect("manual fix", tb.Text, "ok текст ");
+        Expect("exception removed by manual fix", settings.ExceptionWords.Contains("ntrcn").ToString(), "False");
+
+        // 9m. active level: while typing, single word + Enter, phrase context
+        settings.SwitchWhileTyping = true; engine.ReloadSettings();
+        Reset(); SetLang(Lang.En);
+        TypeKeys("ghbd");
+        Expect("fixed while typing", tb.Text, "прив");
+        Expect("layout switched while typing", engine.CurrentLang?.ToString() ?? "?", "Ru");
+        TypeKeys("tn ");
+        Expect("rest of the word in the right layout", tb.Text, "привет ");
+        Reset(); SetLang(Lang.En);
+        TypeKeys("const ");
+        Expect("English word not touched while typing", tb.Text, "const ");
+        settings.SwitchWhileTyping = false; engine.ReloadSettings();
+        Reset(); SetLang(Lang.En);
+        TypeKeys("ntrcn"); Tap(0x0D); Pump(250);
+        Expect("single dictionary word + Enter fixed", tb.Text, "текст\r\n");
+        Reset(); SetLang(Lang.En);
+        TypeKeys("asdfgh"); Tap(0x0D); Pump(250);
+        Expect("single non-word + Enter kept (password-like)", tb.Text, "asdfgh\r\n");
+        Reset(); SetLang(Lang.En);
+        TypeKeys("ghbdtn ds ");
+        Expect("phrase context: ds → вы after привет", tb.Text, "привет вы ");
+        settings.SwitchWhileTyping = true; engine.ReloadSettings();
+
         // 10. Caps Lock accident
         Reset(); SetLang(Lang.En);
         Tap(0x14);
@@ -334,6 +394,45 @@ internal static class E2E
         File.Delete(Settings.FilePath);
         Console.WriteLine(failed == 0 ? "E2E: all passed" : $"E2E: {failed} failed");
         return failed;
+    }
+
+    /// <summary>
+    /// Check the OKBoard instance that is actually running (installed app), not a test engine: type words in the
+    /// wrong layout into a test window and report what the running app made of them.
+    /// </summary>
+    public static int Probe()
+    {
+        var layouts = new LayoutManager();
+        var form = new Form { Text = "OKBoard probe", Width = 600, Height = 200, TopMost = true, StartPosition = FormStartPosition.CenterScreen };
+        var tb = new TextBox { Dock = DockStyle.Fill, Multiline = true, Font = new Font("Segoe UI", 14) };
+        form.Controls.Add(tb);
+        form.Show();
+        SetForegroundWindow(form.Handle); form.Activate(); tb.Focus(); Pump(300);
+        if (Native.GetForegroundWindow() != form.Handle) { Key(0xA4, false); Key(0xA4, true); SetForegroundWindow(form.Handle); form.Activate(); tb.Focus(); Pump(300); }
+        AllowedForeground.Add(form.Handle);
+        int ok = 0, total = 0;
+        try
+        {
+            foreach (var (keys, lang, expect) in new (string, Lang, string)[]
+                     {
+                         ("ghbdtn ", Lang.En, "привет "), ("cjkywt ", Lang.En, "солнце "), ("ntrcn ", Lang.En, "текст "),
+                         ("ghjuhfvvf ", Lang.En, "программа "), ("hello ", Lang.Ru, "hello "), ("world ", Lang.Ru, "world "),
+                         ("rfr ", Lang.En, "как "), ("yflj ", Lang.En, "надо "),
+                     })
+            {
+                tb.Clear(); Tap(0x23); Pump(100);
+                layouts.Switch(lang, tb.Handle); Pump(250);
+                TypeKeys("ok " + keys, 600);
+                total++;
+                bool good = tb.Text == "ok " + expect;
+                if (good) ok++;
+                Console.WriteLine($"{(good ? "ok  " : "FAIL")} typed '{keys.Trim()}' in {lang}: got \"{tb.Text}\", expected \"ok {expect}\"");
+            }
+        }
+        catch (FocusLostException ex) { Console.WriteLine($"ABORTED: focus went to {ex.Message}"); }
+        finally { AllowedForeground.Clear(); form.Close(); }
+        Console.WriteLine($"probe: {ok}/{total} corrected by the running app");
+        return ok == total ? 0 : 1;
     }
 
     private static IEnumerable<Control> Descendants(Control c)

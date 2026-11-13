@@ -67,6 +67,48 @@ internal static class WordData
         lol btw omg thx pls imho asap fyi gonna wanna gotta
         """;
 
+    public const string RuMore = """
+        привет приветик здравствуй здравствуйте спасибо пожалуйста пока хорошо отлично нормально норм понятно ясно
+        конечно наверное возможно сегодня завтра вчера сейчас щас потом сначала давай давайте можно нужно надо
+        хочу хочешь хочет хотел хотела можешь может могу смогу сможешь сделаю сделаешь сделал сделала сделали
+        делаю делаешь делает думаю думаешь знаю знаешь помню помнишь вижу видишь пишу пишешь напиши напишу
+        позвони позвоню звоню звонил звонила скажи скажу сказал сказала говорю говоришь посмотри посмотрю
+        смотрю смотрел работаю работает работал работала работу работы занят занята свободен свободна
+        встреча встречу встрече созвон созвонимся звонок письмо сообщение ответ ответь ответил вопрос вопросы
+        проблема проблемы задача задачи задачу проект проекта проекты решение готово готов готова сделано
+        проверь проверю проверил проверила посмотрел посмотрела отправь отправлю отправил отправила получил
+        получила скинь скину скинул файл файлы папка ссылка ссылку ссылки документ документы таблица таблицу
+        коммит коммиты мерж мержу смержил пулл пуш запушил релиз релизы деплой задеплоил билд билды сборка
+        сборку баг баги багов фича фичи фичу тикет тикеты таска таски тест тесты тестирую ревью фидбек дедлайн
+        митинг митинга стендап спринт бэклог продакшн прод сервер сервера база базы данные код кода коде
+        программа программы прога компьютер комп ноутбук телефон интернет сайт браузер приложение приложения
+        настройки обновление версия версии ошибка ошибки ошибку работает сломалось починил починила
+        кстати короче вообще вроде типа просто очень слишком совсем почти уже еще ещё тоже также только
+        всегда никогда иногда часто редко сразу быстро медленно долго скоро поздно рано утром вечером ночью
+        неделя неделю неделе месяц месяца год года день дня дней часа часов минут минуту секунду
+        хорошего доброе утро добрый день вечер спокойной ночи увидимся пожалуйста извини извините прости
+        согласен согласна отлично супер класс круто классно здорово ладно окей ок спс плз имхо лол кек
+        человек люди друг друзья брат сестра мама папа семья дети ребенок дом домой работе офис офисе
+        деньги цена стоимость оплата оплатить счет счёт заказ заказа доставка магазин купить продать
+        """;
+
+    public const string EnMore = """
+        hello hi hey thanks thank please sorry okay yes yeah yep nope sure maybe today tomorrow yesterday
+        tonight morning evening night week month year time minute hour second soon later now still already
+        just only also very really quite actually basically probably definitely maybe almost always never
+        sometimes often again together meeting call email message reply question answer problem issue task
+        project file folder link document table sheet report update version release build deploy fix bug
+        feature ticket review feedback deadline sprint standup backlog server database data code test tests
+        testing debug error errors warning crash works working broken fixed done ready check checked send
+        sent receive received download upload install settings setting option options window windows screen
+        keyboard mouse layout language english russian ukrainian switch switcher please help need want know
+        think see look looking going doing make making made thing things stuff great good nice cool awesome
+        perfect fine right wrong true false correct
+        vs ye eg ie js ts db ip os pc pr qa ui ux ctx cfg evt rect gti yyyy msg btn img src dst tmp idx len str obj
+        num arr res req ptr buf fmt pos dir env ext ref repo impl init util utils param params arg args func proc
+        ctl lbl txt pic doc docs spec specs sync async enum bool const readonly nullable hwnd hkl vk dpi rgb argb
+        """;
+
     public const string Uk = """
         і в не на я бути він з що а по це вона цей до але вони ми як із у який те за свій весь рік від так
         про для ти же все той могти ви людина такий його сказати тільки або ще би себе один вже коли час якщо
