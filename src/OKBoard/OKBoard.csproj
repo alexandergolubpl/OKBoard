@@ -9,7 +9,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <AssemblyName>OKBoard</AssemblyName>
     <RootNamespace>OKBoard</RootNamespace>
-    <Version>0.2.6</Version>
+    <Version>0.2.7</Version>
     <ApplicationIcon>OKBoard.ico</ApplicationIcon>
     <Product>OKBoard</Product>
     <Description>Smart RU/EN keyboard layout switcher</Description>

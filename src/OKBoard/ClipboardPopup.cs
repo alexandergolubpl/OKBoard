@@ -43,6 +43,8 @@ internal sealed class ClipboardPopup : Form
         Controls.Add(listHost);
         Controls.Add(top);
         Controls.Add(_hint);
+        Theme.WrapInputs(top);
+        _list.BorderStyle = BorderStyle.None;
         ResumeLayout(true);
         Theme.Apply(this);
         _list.BackColor = Theme.P.Window;

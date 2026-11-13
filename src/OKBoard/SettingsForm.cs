@@ -35,7 +35,7 @@ internal sealed class SettingsForm : Form
     private readonly Action _applyHistory;
     private readonly List<Snippet> _snips;
     private readonly NumericUpDown _historySize = new() { Minimum = 5, Maximum = 200, Width = 70 };
-    private readonly ComboBox _level = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 380 };
+    private readonly RoundCombo _level = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 380 };
 
     public SettingsForm(Settings settings, Engine engine, Action applyHistory)
     {
@@ -87,8 +87,8 @@ internal sealed class SettingsForm : Form
         sidebar.Controls.Add(brand);
 
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Padding = new Padding(20, 10, 20, 14) };
-        var ok = new Button { Text = "Сохранить", AutoSize = true, MinimumSize = new Size(120, 34), Tag = "primary", DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = "Отмена", AutoSize = true, MinimumSize = new Size(110, 34) };
+        var ok = new RoundButton { Text = "Сохранить", AutoSize = true, MinimumSize = new Size(120, 34), Tag = "primary", DialogResult = DialogResult.OK };
+        var cancel = new RoundButton { Text = "Отмена", AutoSize = true, MinimumSize = new Size(110, 34) };
         ok.Click += (_, _) => { Apply(); Close(); };
         cancel.Click += (_, _) => Close();
         buttons.Controls.Add(cancel);
@@ -102,6 +102,7 @@ internal sealed class SettingsForm : Form
         Controls.Add(sidebar);
 
         SelectTab(0);
+        Theme.WrapInputs(this);
         ResumeLayout(true);
         ApplyTheme();
         Theme.Changed += ApplyTheme;
@@ -239,14 +240,14 @@ internal sealed class SettingsForm : Form
         foreach (var (action, name) in HotkeyNames)
         {
             var box = new HotkeyBox(_engine) { Width = 180, Text = _s.Hotkeys.GetValueOrDefault(action, "") };
-            var clear = new Button { Text = "✕", Width = 34, Height = box.Height + 2 };
+            var clear = new RoundButton { Text = "✕", Width = 34, Height = box.Height + 2 };
             clear.Click += (_, _) => box.Text = "";
             _hotkeyBoxes[action] = box;
             t.Controls.Add(new Label { Text = name, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 8, 3, 3) });
             t.Controls.Add(box);
             t.Controls.Add(clear);
         }
-        var reset = new Button { Text = "По умолчанию", AutoSize = true, Margin = new Padding(3, 12, 3, 3) };
+        var reset = new RoundButton { Text = "По умолчанию", AutoSize = true, Margin = new Padding(3, 12, 3, 3) };
         reset.Click += (_, _) =>
         {
             foreach (var (a, v) in Settings.DefaultHotkeys())
@@ -338,8 +339,8 @@ internal sealed class SettingsForm : Form
         text.TextChanged += (_, _) => Store();
 
         var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
-        var add = new Button { Text = "Добавить", AutoSize = true };
-        var del = new Button { Text = "Удалить", AutoSize = true };
+        var add = new RoundButton { Text = "Добавить", AutoSize = true };
+        var del = new RoundButton { Text = "Удалить", AutoSize = true };
         add.Click += (_, _) => { _snips.Add(new Snippet()); Rebuild(_snips.Count - 1); abbr.Focus(); };
         del.Click += (_, _) =>
         {
@@ -376,9 +377,9 @@ internal sealed class SettingsForm : Form
         split.Controls.Add(_words, 1, 1);
 
         var addRow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
-        var running = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 220 };
+        var running = new RoundCombo { DropDownStyle = ComboBoxStyle.DropDownList, Width = 220 };
         running.Items.AddRange(RunningApps());
-        var add = new Button { Text = "Добавить", AutoSize = true };
+        var add = new RoundButton { Text = "Добавить", AutoSize = true };
         add.Click += (_, _) =>
         {
             if (running.SelectedItem is string s && !_apps.Lines.Contains(s, StringComparer.OrdinalIgnoreCase))
@@ -453,7 +454,7 @@ internal sealed class SettingsForm : Form
         foreach (var e in _engine.Log)
             _log.Items.Add(new ListViewItem([e.Time.ToString("HH:mm:ss"), e.App, e.From, e.To, e.Kind]) { Tag = e });
         var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true };
-        var never = new Button { Text = "Это было ошибкой — не исправлять такое слово", AutoSize = true };
+        var never = new RoundButton { Text = "Это было ошибкой — не исправлять такое слово", AutoSize = true };
         never.Click += (_, _) =>
         {
             foreach (ListViewItem item in _log.SelectedItems)

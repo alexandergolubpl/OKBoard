@@ -119,7 +119,7 @@ dotnet publish src/OKBoard -c Release -r win-x64 --self-contained true -p:Publis
 Установщик и переносная версия (нужен [Inno Setup 6](https://jrsoftware.org/isinfo.php)):
 
 ```powershell
-.\installer\build.ps1 -Version 0.2.6   # результат в .\dist
+.\installer\build.ps1 -Version 0.2.7   # результат в .\dist
 ```
 
 Тесты:

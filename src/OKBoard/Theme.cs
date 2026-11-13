@@ -178,6 +178,55 @@ internal static class Theme
 
     // ─────────────────────────── controls ───────────────────────────
 
+    /// <summary>
+    /// Put every text box / list / number box of a window into a <see cref="RoundFrame"/> (rounded border),
+    /// keeping its place: table cell and span, flow order, dock, size and margin.
+    /// </summary>
+    public static void WrapInputs(Control root)
+    {
+        var inputs = new List<Control>();
+        void Collect(Control c)
+        {
+            foreach (Control x in c.Controls)
+            {
+                if (x is RoundFrame) continue;
+                if (x is TextBoxBase or ListBox or ListView or NumericUpDown) inputs.Add(x);
+                else Collect(x);
+            }
+        }
+        Collect(root);
+        foreach (var c in inputs)
+        {
+            var parent = c.Parent!;
+            int index = parent.Controls.GetChildIndex(c);
+            var table = parent as TableLayoutPanel;
+            var cell = table?.GetCellPosition(c);
+            int colSpan = table?.GetColumnSpan(c) ?? 1, rowSpan = table?.GetRowSpan(c) ?? 1;
+            bool single = c is TextBox { Multiline: false } || c is NumericUpDown;
+            var pad = single ? new Padding(8, 5, 6, 4) : new Padding(6, 5, 3, 5);
+            var frame = new RoundFrame
+            {
+                Dock = c.Dock, Anchor = c.Anchor, Margin = c.Margin, Padding = pad,
+                Size = new Size(c.Width, c.Height + (single ? pad.Vertical : 0)),
+            };
+            parent.SuspendLayout();
+            parent.Controls.Remove(c);
+            c.Margin = Padding.Empty;
+            c.Dock = DockStyle.Fill;
+            frame.Controls.Add(c);
+            parent.Controls.Add(frame);
+            parent.Controls.SetChildIndex(frame, index);
+            if (table != null && cell is { } pos)
+            {
+                table.SetCellPosition(frame, pos);
+                table.SetColumnSpan(frame, colSpan);
+                table.SetRowSpan(frame, rowSpan);
+            }
+            parent.ResumeLayout();
+            frame.Hook(c);
+        }
+    }
+
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Control, object> Hooked = new();
 
     /// <summary>Owner-drawn list items: rounded highlight in the theme colours instead of system blue.</summary>
@@ -260,27 +309,27 @@ internal static class Theme
             case TextBox tb:
                 tb.BackColor = p.Surface;
                 tb.ForeColor = p.Text;
-                tb.BorderStyle = BorderStyle.FixedSingle;
+                tb.BorderStyle = tb.Parent is RoundFrame ? BorderStyle.None : BorderStyle.FixedSingle;
                 NativeTheme(tb, "DarkMode_Explorer");
                 break;
             case ListBox lb:
                 lb.BackColor = p.Surface;
                 lb.ForeColor = p.Text;
-                lb.BorderStyle = BorderStyle.FixedSingle;
+                lb.BorderStyle = lb.Parent is RoundFrame ? BorderStyle.None : BorderStyle.FixedSingle;
                 NativeTheme(lb, "DarkMode_Explorer");
                 FluentList(lb);
                 break;
             case ListView lv:
                 lv.BackColor = p.Surface;
                 lv.ForeColor = p.Text;
-                lv.BorderStyle = BorderStyle.FixedSingle;
+                lv.BorderStyle = lv.Parent is RoundFrame ? BorderStyle.None : BorderStyle.FixedSingle;
                 NativeTheme(lv, "DarkMode_ItemsView");
                 FluentHeader(lv);
                 break;
             case NumericUpDown n:
                 n.BackColor = p.Surface;
                 n.ForeColor = p.Text;
-                n.BorderStyle = BorderStyle.FixedSingle;
+                n.BorderStyle = n.Parent is RoundFrame ? BorderStyle.None : BorderStyle.FixedSingle;
                 break;
             case ComboBox cb:
                 cb.BackColor = p.Surface;
@@ -328,6 +377,170 @@ internal static class Theme
                 c.ForeColor = p.Text;
                 break;
         }
+    }
+}
+
+/// <summary>Rounded border around an input (Windows 11 style): accent line at the bottom while it has focus.</summary>
+internal sealed class RoundFrame : Panel
+{
+    private bool _focused, _hover;
+    private Control? _inner;
+
+    /// <summary>A one-line input: the frame takes the input's height plus padding (text vertically centred).</summary>
+    private bool SingleLine => _inner is TextBox { Multiline: false } or NumericUpDown;
+
+    protected override void OnLayout(LayoutEventArgs e)
+    {
+        if (SingleLine && Dock is DockStyle.None or DockStyle.Top or DockStyle.Bottom)
+        {
+            int h = _inner!.PreferredSize.Height + Padding.Vertical;
+            if (Height != h) Height = h;
+        }
+        base.OnLayout(e);
+    }
+
+    public RoundFrame()
+    {
+        Tag = "keep";
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint |
+                 ControlStyles.ResizeRedraw, true);
+    }
+
+    public void Hook(Control inner)
+    {
+        _inner = inner;
+        PerformLayout();
+        inner.GotFocus += (_, _) => { _focused = true; Invalidate(); };
+        inner.LostFocus += (_, _) => { _focused = false; Invalidate(); };
+        inner.MouseEnter += (_, _) => { _hover = true; Invalidate(); };
+        inner.MouseLeave += (_, _) => { _hover = false; Invalidate(); };
+        MouseDown += (_, _) => inner.Focus();
+        Theme.Changed += () => { if (!IsDisposed) { BackColor = Theme.P.Surface; Invalidate(); } };
+        BackColor = Theme.P.Surface;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var p = Theme.P;
+        var g = e.Graphics;
+        g.Clear(Parent?.BackColor is { A: 255 } outside ? outside : p.Window);
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        float r = LogicalToDeviceUnits(5);
+        var rect = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+        using var path = Theme.RoundRect(rect, r);
+        using (var fill = new SolidBrush(p.Surface)) g.FillPath(fill, path);   // the inner control is Surface too
+        using (var pen = new Pen(_focused || _hover ? (p.Dark ? ControlPaint.Light(p.Border, 0.4f) : ControlPaint.Dark(p.Border, 0.1f)) : p.Border))
+            g.DrawPath(pen, path);
+        if (_focused)
+        {
+            // the Windows 11 focus cue: an accent line along the bottom edge, inside the rounded corners
+            using var accent = new Pen(p.Accent, LogicalToDeviceUnits(2));
+            g.SetClip(path);
+            g.DrawLine(accent, 0, Height - 1.5f, Width, Height - 1.5f);
+            g.ResetClip();
+        }
+    }
+}
+
+/// <summary>Drop-down list drawn in the Windows 11 style: rounded border, chevron, themed items.</summary>
+internal sealed class RoundCombo : ComboBox
+{
+    private bool _hover;
+
+    public RoundCombo()
+    {
+        DropDownStyle = ComboBoxStyle.DropDownList;
+        DrawMode = DrawMode.OwnerDrawFixed;
+        Tag = "keep";
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                 ControlStyles.ResizeRedraw, true);
+    }
+
+    protected override void OnFontChanged(EventArgs e) { base.OnFontChanged(e); ItemHeight = (int)(Font.Height * 1.6); }
+    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); ItemHeight = (int)(Font.Height * 1.6); }
+    protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnSelectedIndexChanged(EventArgs e) { base.OnSelectedIndexChanged(e); Invalidate(); }
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var p = Theme.P;
+        var g = e.Graphics;
+        g.Clear(Parent?.BackColor is { A: 255 } outside ? outside : p.Window);
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        var rect = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+        using var path = Theme.RoundRect(rect, LogicalToDeviceUnits(5));
+        using (var b = new SolidBrush(_hover || DroppedDown ? p.Hover : p.Surface)) g.FillPath(b, path);
+        using (var pen = new Pen(p.Border)) g.DrawPath(pen, path);
+        if (Focused)
+        {
+            using var accent = new Pen(p.Accent, LogicalToDeviceUnits(2));
+            g.SetClip(path);
+            g.DrawLine(accent, 0, Height - 1.5f, Width, Height - 1.5f);
+            g.ResetClip();
+        }
+        int chevron = LogicalToDeviceUnits(28);
+        TextRenderer.DrawText(g, Text, Font, new Rectangle(LogicalToDeviceUnits(9), 0, Width - chevron - LogicalToDeviceUnits(9), Height),
+            Enabled ? p.Text : p.Disabled, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        Theme.DrawGlyph(g, '', new Rectangle(Width - chevron, 0, chevron - LogicalToDeviceUnits(4), Height), p.SubText, LogicalToDeviceUnits(11));
+    }
+
+    protected override void OnDrawItem(DrawItemEventArgs e)
+    {
+        if (e.Index < 0) return;
+        var p = Theme.P;
+        bool sel = (e.State & DrawItemState.Selected) != 0;
+        using (var bg = new SolidBrush(sel ? p.Hover : p.Surface)) e.Graphics.FillRectangle(bg, e.Bounds);
+        TextRenderer.DrawText(e.Graphics, GetItemText(Items[e.Index]), Font,
+            new Rectangle(e.Bounds.X + 8, e.Bounds.Y, e.Bounds.Width - 10, e.Bounds.Height), p.Text,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+    }
+}
+
+/// <summary>Button drawn with rounded corners; Tag "primary" = accent button.</summary>
+internal sealed class RoundButton : Button
+{
+    private bool _hover, _down;
+
+    public RoundButton()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint |
+                 ControlStyles.ResizeRedraw, true);
+        Cursor = Cursors.Hand;
+    }
+
+    private bool Primary => Tag as string == "primary";
+
+    protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { _hover = false; _down = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { _down = true; Invalidate(); base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { _down = false; Invalidate(); base.OnMouseUp(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var p = Theme.P;
+        var g = e.Graphics;
+        g.Clear(Parent?.BackColor is { A: 255 } outside ? outside : p.Window);
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        var rect = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+        using var path = Theme.RoundRect(rect, LogicalToDeviceUnits(5));
+        Color fill = Primary
+            ? (_down ? ControlPaint.Dark(p.Accent, 0.05f) : _hover ? ControlPaint.Light(p.Accent, 0.15f) : p.Accent)
+            : (_down ? p.Selected : _hover ? p.Hover : p.Surface);
+        using (var b = new SolidBrush(Enabled ? fill : p.Surface)) g.FillPath(b, path);
+        if (!Primary)
+            using (var pen = new Pen(p.Border)) g.DrawPath(pen, path);
+        if (Focused && ShowFocusCues)
+        {
+            using var fp = new Pen(p.Accent, LogicalToDeviceUnits(2));
+            using var inner = Theme.RoundRect(new RectangleF(2, 2, Width - 5, Height - 5), LogicalToDeviceUnits(4));
+            g.DrawPath(fp, inner);
+        }
+        var color = !Enabled ? p.Disabled : Primary ? p.AccentText : p.Text;
+        TextRenderer.DrawText(g, Text, Font, ClientRectangle, color,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
     }
 }
 

@@ -55,7 +55,7 @@ internal static class UiShots
 
             var form = new SettingsForm(settings, engine, () => { }) { StartPosition = FormStartPosition.Manual, Location = new Point(100, 80), TopMost = true };
             form.Show();
-            foreach (var (page, name) in new[] { (0, "general"), (SettingsForm.RulesTab, "rules"), (SettingsForm.LogTab, "log") })
+            foreach (var (page, name) in new[] { (0, "general"), (1, "hotkeys"), (SettingsForm.RulesTab, "rules"), (3, "snippets"), (4, "exceptions"), (SettingsForm.LogTab, "log") })
             {
                 form.SelectTab(page);
                 Settle();
