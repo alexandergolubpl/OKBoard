@@ -29,12 +29,17 @@ internal sealed class SpellChecker
     [ComImport, Guid("7AB36653-1796-484B-BDFA-E74F1DB7C1DC")]
     private class SpellCheckerFactoryClass;
 
-    private ISpellChecker? _checker;
+    private ISpellChecker? _checker;                  // touched only on the worker thread
     private readonly Dictionary<string, bool> _cache = new();
+    private readonly object _cacheLock = new();
+    private readonly System.Collections.Concurrent.BlockingCollection<Action> _work = new();
+    private readonly Thread _worker;
+    private long _lastCreateAttempt;
+    private const int CallTimeoutMs = 250;
 
-    public bool Available => _checker != null;
+    public bool Available { get; private set; }
     public string Tag { get; }
-    /// <summary>Calls that failed (COM error) and how often the checker was re-created.</summary>
+    /// <summary>Calls that failed (COM error / timeout) and how often the checker was re-created.</summary>
     public int Failures { get; private set; }
     public int Recreated { get; private set; }
     public bool LastSelfTestOk { get; private set; } = true;
@@ -66,10 +71,35 @@ internal sealed class SpellChecker
         return new SpellChecker(tag);
     }
 
+    /// <remarks>
+    /// The Windows spell checker is an out-of-process COM service. The keyboard hook runs inside an
+    /// input-synchronous call, where Windows forbids outgoing cross-process COM calls
+    /// (RPC_E_CANTCALLOUT_ININPUTSYNCCALL): calls made from the hook worked while the dictionary was warm and
+    /// then failed — and so did re-creating the checker — so after a while only the built-in word lists still
+    /// corrected anything. All COM work therefore happens on this dedicated STA thread; the hook only waits
+    /// for the answer (a plain wait, not a COM call), at most <see cref="CallTimeoutMs"/>.
+    /// </remarks>
     public SpellChecker(string languageTag)
     {
         Tag = languageTag;
-        _checker = Create(languageTag);
+        _worker = new Thread(() => { foreach (var job in _work.GetConsumingEnumerable()) job(); })
+        {
+            IsBackground = true, Name = "OKBoard spell " + languageTag,
+        };
+        _worker.SetApartmentState(ApartmentState.STA);
+        _worker.Start();
+        Available = Invoke(() => { _checker = Create(languageTag); _lastCreateAttempt = Environment.TickCount64; return _checker != null; }, 5000);
+    }
+
+    /// <summary>Run on the worker thread and wait for the result (default if it takes too long).</summary>
+    private T? Invoke<T>(Func<T> f, int timeoutMs = CallTimeoutMs)
+    {
+        if (Thread.CurrentThread == _worker) return f();
+        T? result = default;
+        using var done = new ManualResetEventSlim();
+        try { _work.Add(() => { try { result = f(); } catch { } finally { try { done.Set(); } catch (ObjectDisposedException) { } } }); }
+        catch (InvalidOperationException) { return default; }
+        return done.Wait(timeoutMs) ? result : default;
     }
 
     private static ISpellChecker? Create(string tag)
@@ -84,15 +114,14 @@ internal sealed class SpellChecker
         return null;
     }
 
-    /// <summary>
-    /// Drop the COM object and make a new one. After many hours, sleep/resume or a restart of the Windows text
-    /// services the old object can start failing every call; every word that needs the dictionary then looks
-    /// "unknown" and only the built-in common words still get corrected.
-    /// </summary>
-    public bool Recreate()
+    /// <summary>Drop the COM object and make a new one (on the worker thread).</summary>
+    public bool Recreate() => Invoke(RecreateOnWorker, 5000);
+
+    private bool RecreateOnWorker()
     {
         try { if (_checker != null) Marshal.ReleaseComObject(_checker); } catch { }
         _checker = Create(Tag);
+        _lastCreateAttempt = Environment.TickCount64;
         Recreated++;
         Engine.Trace?.Invoke($"spell checker {Tag} re-created (ok={_checker != null})");
         return _checker != null;
@@ -103,13 +132,11 @@ internal sealed class SpellChecker
     {
         var probe = Tag.StartsWith("ru", StringComparison.OrdinalIgnoreCase) ? "солнце"
                   : Tag.StartsWith("uk", StringComparison.OrdinalIgnoreCase) ? "сонце" : "house";
-        _cache.Remove(probe);
-        bool ok = IsCorrect(probe) == true;
+        bool ok = Invoke(() => CheckOnWorker(probe) == true, 5000);
         if (!ok)
         {
             Recreate();
-            _cache.Remove(probe);
-            ok = IsCorrect(probe) == true;
+            ok = Invoke(() => CheckOnWorker(probe) == true, 5000);
             Engine.Trace?.Invoke($"spell checker {Tag} self-test failed; after re-create ok={ok}");
         }
         LastSelfTestOk = ok;
@@ -129,25 +156,37 @@ internal sealed class SpellChecker
         catch { return null; }
     }
 
-    /// <summary>True if the word is spelled correctly; null if the checker is unavailable.</summary>
-    public bool? IsCorrect(string word)
+    /// <summary>Worker thread: check, re-creating the COM object once if the call fails.</summary>
+    private bool? CheckOnWorker(string word)
     {
-        if (string.IsNullOrWhiteSpace(word)) return null;
-        if (_cache.TryGetValue(word, out var cached)) return cached;
-        if (_checker == null) return null;
+        if (_checker == null)
+        {
+            // a failed re-create is retried at most every 5 s (the service may be restarting)
+            if (Environment.TickCount64 - _lastCreateAttempt < 5000 || !RecreateOnWorker()) return null;
+        }
         bool? r = TryCheck(word);
         if (r == null)
         {
-            // The COM object went bad: re-create it once and retry.
             Failures++;
             if (Failures % 50 == 1) Engine.Trace?.Invoke($"spell checker {Tag} call failed ({Failures} so far)");
-            if (!Recreate()) return null;
+            if (!RecreateOnWorker()) return null;
             r = TryCheck(word);
-            if (r == null) return null;
         }
-        bool result = r.Value;
-        if (_cache.Count > 20000) _cache.Clear();
-        _cache[word] = result;
+        return r;
+    }
+
+    /// <summary>True if the word is spelled correctly; null if the checker is unavailable. Any thread.</summary>
+    public bool? IsCorrect(string word)
+    {
+        if (string.IsNullOrWhiteSpace(word)) return null;
+        lock (_cacheLock) if (_cache.TryGetValue(word, out var cached)) return cached;
+        var r = Invoke<bool?>(() => CheckOnWorker(word));
+        if (r is not { } result) return null;
+        lock (_cacheLock)
+        {
+            if (_cache.Count > 20000) _cache.Clear();
+            _cache[word] = result;
+        }
         return result;
     }
 }
