@@ -100,7 +100,7 @@ internal static class InputSender
 }
 
 /// <summary>Finds the installed EN/RU/UK layouts and reads/changes the layout of the focused window.</summary>
-internal sealed class LayoutManager
+internal class LayoutManager
 {
     [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
     private static extern int ToUnicodeEx(uint vk, uint scan, byte[] state, System.Text.StringBuilder buf, int size, uint flags, IntPtr hkl);
@@ -111,7 +111,7 @@ internal sealed class LayoutManager
     private readonly Dictionary<Lang, IntPtr> _hkl = new();
     private (Lang lang, long tick, IntPtr hwnd)? _pending;
     /// <summary>When OKBoard itself last changed a layout (to tell it apart from the user doing it).</summary>
-    public long LastOwnSwitchTick { get; private set; }
+    public virtual long LastOwnSwitchTick { get; protected set; }
 
     /// <summary>Supported layouts installed in Windows, in the order of the system language list.</summary>
     public List<Lang> Installed { get; } = [];
@@ -161,7 +161,7 @@ internal sealed class LayoutManager
         }
     }
 
-    public bool Has(Lang l) => _hkl.ContainsKey(l);
+    public virtual bool Has(Lang l) => _hkl.ContainsKey(l);
     public bool HasLatinAndCyrillic => Has(Lang.En) && (Has(Lang.Ru) || Has(Lang.Uk));
 
     public static IntPtr FocusWindow(out uint threadId)
@@ -175,7 +175,7 @@ internal sealed class LayoutManager
     }
 
     /// <summary>Layout of the focused window (null if it isn't one we support).</summary>
-    public Lang? Current()
+    public virtual Lang? Current()
     {
         var hwnd = FocusWindow(out var tid);
         // A layout change we requested may not be applied yet; trust it for a short while.
@@ -183,7 +183,7 @@ internal sealed class LayoutManager
         return LangOf(GetKeyboardLayout(tid));
     }
 
-    public void Switch(Lang lang, IntPtr? target = null)
+    public virtual void Switch(Lang lang, IntPtr? target = null)
     {
         if (!_hkl.TryGetValue(lang, out var hkl)) return;
         var hwnd = target ?? FocusWindow(out _);
@@ -202,4 +202,22 @@ internal sealed class LayoutManager
         if (!cls.Contains("Edit", StringComparison.OrdinalIgnoreCase)) return false;
         return ((long)GetWindowLongPtr(hwnd, GWL_STYLE) & ES_PASSWORD) != 0;
     }
+}
+
+/// <summary>Where the engine's synthetic typing goes. Real: SendInput. Tests: a virtual document.</summary>
+internal interface IOutput
+{
+    void Backspace(int count);
+    void Text(string text);
+    void Tap(ushort vk);
+    void ReleaseModifiers(IEnumerable<ushort> held);
+}
+
+internal sealed class RealOutput : IOutput
+{
+    public static readonly RealOutput Instance = new();
+    public void Backspace(int count) => InputSender.Backspace(count);
+    public void Text(string text) => InputSender.Text(text);
+    public void Tap(ushort vk) => InputSender.Tap(vk);
+    public void ReleaseModifiers(IEnumerable<ushort> held) => InputSender.ReleaseModifiers(held);
 }

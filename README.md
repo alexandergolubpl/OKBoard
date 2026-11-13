@@ -118,7 +118,7 @@ dotnet publish src/OKBoard -c Release -r win-x64 --self-contained true -p:Publis
 Установщик и переносная версия (нужен [Inno Setup 6](https://jrsoftware.org/isinfo.php)):
 
 ```powershell
-.\installer\build.ps1 -Version 0.2.4   # результат в .\dist
+.\installer\build.ps1 -Version 0.2.5   # результат в .\dist
 ```
 
 Тесты:
@@ -128,7 +128,14 @@ dotnet run --project tests/OKBoard.Tests            # детектор, конв
 dotnet run --project tests/OKBoard.Tests -- --e2e   # реальное окно + реальный хук, ~4 минуты; не переключайте окна
                                                     # (если фокус уйдёт в другое окно, тест остановится сам)
 dotnet run --project tests/OKBoard.Tests -- --update-live   # скачать последний релиз и проверить SHA-256 (без установки)
+dotnet run --project tests/OKBoard.Tests -- --replay 30     # «напечатать» ваши запросы к Claude Code за 30 дней
 ```
+
+`--replay` прогоняет через настоящий движок (виртуальная клавиатура, документ и часы, ~2 секунды на месяц) всё,
+что вы печатали в Claude Code в других проектах (`~/.claude/projects`), в двух сценариях: «аккуратный» (раскладку
+переключаете сами — любое изменение текста считается ошибкой) и «забывчивый» (не переключаете — считаются пропуски
+и неверные исправления). Ваши тексты читаются только локально и никуда не сохраняются; на экран выводятся
+статистика и проблемные слова.
 
 Настройки: `%APPDATA%\OKBoard\settings.json`.
 

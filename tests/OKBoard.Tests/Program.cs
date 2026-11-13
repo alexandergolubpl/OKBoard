@@ -49,6 +49,18 @@ if (args.Contains("--why"))
     return 0;
 }
 
+if (args.Length >= 1 && args[0] == "--replay")
+{
+    int days = args.Length >= 2 && int.TryParse(args[1], out var dd) ? dd : 7;
+    string? only = args.Length >= 3 ? args[2] : null;
+    int rcR = 1;
+    var tr = new Thread(() => rcR = Replay.Run(days, only));
+    tr.SetApartmentState(ApartmentState.STA);
+    tr.Start();
+    tr.Join();
+    return rcR;
+}
+
 if (args.Contains("--probe"))
 {
     int rcP = 1;

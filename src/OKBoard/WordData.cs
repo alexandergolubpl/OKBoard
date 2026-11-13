@@ -104,7 +104,7 @@ internal static class WordData
         keyboard mouse layout language english russian ukrainian switch switcher please help need want know
         think see look looking going doing make making made thing things stuff great good nice cool awesome
         perfect fine right wrong true false correct
-        vs ye eg ie js ts db ip os pc pr qa ui ux ctx cfg evt rect gti yyyy msg btn img src dst tmp idx len str obj
+        vs eg ie js ts db ip os pc pr qa ui ux ctx cfg evt rect gti yyyy msg btn img src dst tmp idx len str obj
         num arr res req ptr buf fmt pos dir env ext ref repo impl init util utils param params arg args func proc
         ctl lbl txt pic doc docs spec specs sync async enum bool const readonly nullable hwnd hkl vk dpi rgb argb
         """;

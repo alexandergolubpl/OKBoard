@@ -153,7 +153,7 @@ public sealed class LanguageDetector
     {
         var none = new Decision(false, "prefix: no", LayoutMap.Render(keys, current), "");
         if (Level != Aggressiveness.Active || keys.Count is < 4 or > 7) return none;
-        if (keys.Any(k => k.IsSpace || k.Vk is >= '0' and <= '9')) return none;
+        if (keys.Any(k => k.IsSpace || (k.Vk is >= '0' and <= '9' && !k.Shift))) return none;
         var cur = LayoutMap.Render(keys, current);
         if (IsException(cur.ToLowerInvariant())) return none;
         var cd = _data[current];
@@ -192,12 +192,21 @@ public sealed class LanguageDetector
         Decision Yes(string why, int strength) => new(true, why, cur, alt, other, strength);
 
         if (cur == alt) return No("same text");
-        if (keys.Any(k => k.Vk is >= '0' and <= '9')) return No("contains digits");
+        // An identifier typed in the Cyrillic layout ("ПфьуМшуц" = GameView, "Еуче_Сщшты" = Text_Coins, "цшт10"):
+        // camelCase, underscores and digits are code-like in Latin, but nonsense in Cyrillic.
+        if (LayoutMap.IsCyrillicLang(current) && !LayoutMap.IsCyrillicLang(other) && Identifier(cur, alt, current, other) is { } id)
+            return id;
+        // Real digits only: with Shift the digit row gives punctuation ("там?" is Shift+7 in the Russian layout).
+        if (keys.Any(k => k.Vk is >= '0' and <= '9' && !k.Shift)) return No("contains digits");
         if (cur.Contains('@') || cur.Contains('_') || cur.Contains("://") || cur.Contains('\\') || cur.StartsWith("www.", StringComparison.OrdinalIgnoreCase))
             return No("looks like code/url/email");
 
         var curCore = Core(cur, current);
         var altCore = Core(alt, other);
+        // One-letter words ("d" → "в") only inside a phrase that is already in the other language.
+        if (altCore.Length == 1 && curCore.Length == 1 && inContext && !careful && !IsException(curCore.ToLowerInvariant()) &&
+            _data[other].Common.Contains(altCore.ToLowerInvariant()) && !_data[current].Common.Contains(curCore.ToLowerInvariant()))
+            return Yes("one-letter word, phrase context", 2);
         if (altCore.Length < 2) return No("too short");
         if (IsException(cur.ToLowerInvariant()) || IsException(alt.ToLowerInvariant()) ||
             IsException(curCore.ToLowerInvariant()) || IsException(altCore.ToLowerInvariant()))
@@ -232,10 +241,11 @@ public sealed class LanguageDetector
         }
 
         if (IsBroken(altCore, other)) return No("alternative is not a word");
-        // An upper-case letter inside the converted word comes from Shift+punctuation in code ("t:Prefab" → "еЖЗкуаф",
-        // "a<b>" ...), never from a real word typed in the wrong layout.
-        for (int i = 1; i < altCore.Length; i++)
-            if (char.IsUpper(altCore[i]) && char.IsLower(altCore[i - 1])) return No("alternative has mixed case");
+        // An upper-case letter inside the converted word that comes from Shift+punctuation in code ("t:Prefab" →
+        // "еЖЗкуаф", "a<b>" ...) is never a real word typed in the wrong layout.
+        if (curBroken)
+            for (int i = 1; i < altCore.Length; i++)
+                if (char.IsUpper(altCore[i]) && char.IsLower(altCore[i - 1])) return No("alternative has mixed case");
 
         var od = _data[other];
         if (altCore.Length == 2)
@@ -262,7 +272,7 @@ public sealed class LanguageDetector
         if (IsValid(altCore, other)) return Yes("dictionary", 3);
 
         // Neither form is in a dictionary: fall back to letter statistics.
-        if (altCore.Length >= 4 && !careful)
+        if (altCore.Length >= 4 && !careful && HasVowel(altCore, other))
         {
             var (aAvg, aUnseen) = od.Model.Score(altCore);
             if (aUnseen == 0)
@@ -270,11 +280,40 @@ public sealed class LanguageDetector
                 if (curBroken) return Yes("statistics (current has punctuation inside)", 1);
                 var (cAvg, cUnseen) = _data[current].Model.Score(curCore);
                 if (cUnseen >= 2 && aAvg - cAvg > 1.5) return Yes("statistics", 1);
-                if ((active || inContext) && cUnseen >= 1 && aAvg - cAvg > 0.8) return Yes("statistics (active)", 1);
+                if ((active || inContext) && cUnseen >= 2 && aAvg - cAvg > 1.0) return Yes("statistics (active)", 1);
             }
         }
         return No("not sure");
     }
+
+    private static readonly System.Text.RegularExpressions.Regex IdentifierShape =
+        new(@"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)*$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    private static readonly System.Text.RegularExpressions.Regex IdentifierParts =
+        new(@"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    /// <summary>Cyrillic text that is really a Latin identifier / file name typed in the wrong layout.</summary>
+    private Decision? Identifier(string cur, string alt, Lang current, Lang other)
+    {
+        var c = cur.TrimEnd('.', ',', '!', '?', ';', ':', ')', '"', '\'');
+        var a = LayoutMap.ConvertText(c, current, other);
+        bool camel = false;
+        for (int i = 1; i < c.Length; i++) if (char.IsUpper(c[i]) && char.IsLower(c[i - 1])) camel = true;
+        bool codeish = camel || c.Contains('_') || (c.Any(char.IsDigit) && c.Any(char.IsLetter)) || c.Contains('.');
+        a = a.TrimEnd('.', ',', '!', '?', ';', ':', ')');
+        if (!codeish || c.Length < 4 || !IdentifierShape.IsMatch(a)) return null;
+        var parts = IdentifierParts.Matches(a).Select(m => m.Value).Where(p => p.Length >= 2 && !p.All(char.IsDigit)).ToList();
+        if (parts.Count == 0) return null;
+        int good = parts.Count(p => IsValid(p, other) || _data[other].Model.Score(p.ToLowerInvariant()).unseen == 0);
+        // the Cyrillic pieces must not be real words themselves ("Привет_мир" stays)
+        var cyrParts = System.Text.RegularExpressions.Regex.Matches(c, @"\p{L}+").Select(m => m.Value).Where(p => p.Length >= 2).ToList();
+        int realRu = cyrParts.Count(p => IsValid(p, current));
+        if (good * 2 >= parts.Count && realRu * 2 < Math.Max(1, cyrParts.Count))
+            return new Decision(true, "идентификатор в кириллице", cur, LayoutMap.ConvertText(cur, current, other), other, 2);
+        return null;
+    }
+
+    private static bool HasVowel(string w, Lang l) =>
+        w.ToLowerInvariant().Any(c => LayoutMap.IsCyrillicLang(l) ? "аеёиоуыэюяіїє".Contains(c) : "aeiouy".Contains(c));
 
     /// <summary>How many words of the text are valid in the language (used to pick RU vs UK for a selection).</summary>
     public int CountValidWords(string text, Lang l) =>

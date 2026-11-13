@@ -31,6 +31,15 @@ internal sealed class Engine : IDisposable
     private Lang? _wordStartLang;
     private Lang? _lastCyrillic;
     private AutoFix? _lastAuto;
+
+    // ── test seams: the replay test drives the real engine with a virtual keyboard, document and clock ──
+    internal IOutput Out { get; set; } = RealOutput.Instance;
+    internal Func<long> Clock { get; set; } = () => Environment.TickCount64;
+    /// <summary>No system state (focus, real key state, password fields, full screen) — set by the replay test.</summary>
+    internal bool Simulated { get; set; }
+    private long Now => Clock();
+    /// <summary>Feed one key event as if it came from the hook. True = the engine swallowed it.</summary>
+    internal bool Feed(ushort vk, bool down) => HandleKey(vk, down);
     private List<SwitchRule> _rules = [];
     private Lang? _prevWordLang;      // layout the previous word of this line ended up in
     private bool _midWordTried;       // the while-typing check already ran (and converted or not) for this word
@@ -91,7 +100,7 @@ internal sealed class Engine : IDisposable
         get
         {
             var root = _suspendRoot;
-            if (root == IntPtr.Zero) return false;
+            if (root == IntPtr.Zero || Simulated) return false;
             if (!IsWindow(root)) { _suspendRoot = IntPtr.Zero; return false; }
             return GetAncestor(GetForegroundWindow(), GA_ROOT) == root;
         }
@@ -113,7 +122,7 @@ internal sealed class Engine : IDisposable
         string Original, string Converted, bool IsSnippet)
     {
         /// <summary>When the correction happened: Backspace undoes it only shortly afterwards.</summary>
-        public long Tick { get; } = Environment.TickCount64;
+        public long Tick { get; init; }
     }
 
     /// <summary>State of repeated Pause presses on the same word: cycle through the installed layouts.</summary>
@@ -175,7 +184,7 @@ internal sealed class Engine : IDisposable
     /// </summary>
     public void CheckHookHealth()
     {
-        var nowTick = Environment.TickCount64;
+        var nowTick = Now;
         if (nowTick - _lastSelfTest > 10 * 60_000)
         {
             _lastSelfTest = nowTick;
@@ -209,7 +218,7 @@ internal sealed class Engine : IDisposable
     public void ReinstallHooks(string reason)
     {
         // Throttle automatic re-installs (e.g. elevated windows, where UIPI hides input from our hook).
-        var now = Environment.TickCount64;
+        var now = Now;
         if (!reason.StartsWith("manual") && now - _lastReinstall < (reason.StartsWith("input not seen") ? 30000 : 5000)) { _suspectChecks = 0; _witnessAtLastKey = _witness?.KeyDowns ?? 0; return; }
         _lastReinstall = now;
         if (_kbHook != IntPtr.Zero) UnhookWindowsHookEx(_kbHook);
@@ -358,7 +367,7 @@ internal sealed class Engine : IDisposable
                 if (down)
                 {
                     _witnessAtLastKey = _witness?.KeyDowns ?? 0;
-                    LastHookKeyTick = Environment.TickCount64;
+                    LastHookKeyTick = Now;
                 }
                 try
                 {
@@ -405,7 +414,7 @@ internal sealed class Engine : IDisposable
     /// other keyboard tools, the lock screen and dropped hook events all change it without us seeing a press.
     /// GetKeyState inside the low-level hook reflects the system toggle state (verified).
     /// </summary>
-    private static bool CapsOn => (GetKeyState(VK_CAPITAL) & 1) != 0;
+    private bool CapsOn => !Simulated && (GetKeyState(VK_CAPITAL) & 1) != 0;
 
     /// <summary>
     /// Drop modifiers we think are held but the system says are up — a missed key-up (Win+Shift+S, lock screen,
@@ -414,6 +423,7 @@ internal sealed class Engine : IDisposable
     /// </summary>
     private void SyncModifiers()
     {
+        if (Simulated) return;
         if (_held.Count == 0) return;
         _held.RemoveWhere(vk => (GetAsyncKeyState(vk) & 0x8000) == 0);
     }
@@ -469,7 +479,7 @@ internal sealed class Engine : IDisposable
         {
             Trace?.Invoke($"hotkey {action}");
             // We swallow the key, so the app would see a lone Alt/Win press+release and open its menu / Start.
-            if (AltHeld || WinHeld) InputSender.Tap(0xE8);
+            if (AltHeld || WinHeld) Out.Tap(0xE8);
             var fg = GetForegroundWindow();
             _ui.Post(_ => Run(action, fg), null);
             return true;
@@ -485,7 +495,7 @@ internal sealed class Engine : IDisposable
 
         if (vk == VK_BACK)
         {
-            if (_lastAuto != null && _s.UndoWithBackspace && Environment.TickCount64 - _lastAuto.Tick <= UndoWindowMs)
+            if (_lastAuto != null && _s.UndoWithBackspace && Now - _lastAuto.Tick <= UndoWindowMs)
             {
                 UndoAuto();
                 return true;
@@ -504,13 +514,13 @@ internal sealed class Engine : IDisposable
             if (WordRange().count == 0)
             {
                 _wordStartLang = _layouts.Current();
-                _wordStartTick = Environment.TickCount64;
+                _wordStartTick = Now;
                 _midWordTried = false;
                 _midWordFixed = false;
                 // The layout changed since the last word and it wasn't us: the user switched it by hand.
                 if (_lastLangSeen != null && _wordStartLang != null && _wordStartLang != _lastLangSeen &&
-                    Environment.TickCount64 - _layouts.LastOwnSwitchTick > 1500)
-                    _userSwitchTick = Environment.TickCount64;
+                    Now - _layouts.LastOwnSwitchTick > 1500)
+                    _userSwitchTick = Now;
                 if (_wordStartLang != null) _lastLangSeen = _wordStartLang;
                 if (_wordStartLang is { } l && LayoutMap.IsCyrillicLang(l)) _lastCyrillic = l;
             }
@@ -538,7 +548,7 @@ internal sealed class Engine : IDisposable
         _shiftDown = false;
         if (!_shiftAlone || !_s.DoubleShiftConverts || IsSuspended || IsFullscreenPaused) { _shiftAlone = false; return; }
         _shiftAlone = false;
-        var now = Environment.TickCount64;
+        var now = Now;
         if (_lastShiftTap != 0 && now - _lastShiftTap < 400)
         {
             _lastShiftTap = 0;
@@ -583,6 +593,7 @@ internal sealed class Engine : IDisposable
 
     private string? ForegroundProcess()
     {
+        if (Simulated) return "replay.exe";
         var fg = GetForegroundWindow();
         if (fg != _procCacheHwnd) { _procCacheHwnd = fg; _procCacheName = GetProcessName(fg); }
         return _procCacheName;
@@ -591,7 +602,7 @@ internal sealed class Engine : IDisposable
     public bool IsExcludedApp(string? proc) =>
         proc != null && _s.ExcludedApps.Any(a => a.Trim().Equals(proc, StringComparison.OrdinalIgnoreCase));
 
-    private bool InPasswordField() => _s.SkipPasswordFields && LayoutManager.IsPasswordField();
+    private bool InPasswordField() => !Simulated && _s.SkipPasswordFields && LayoutManager.IsPasswordField();
 
     private bool AutoAllowed() =>
         _s.AutoSwitch && !IsDnd && !IsExcludedApp(ForegroundProcess()) && !InPasswordField();
@@ -600,7 +611,8 @@ internal sealed class Engine : IDisposable
 
     private bool IsFullscreen()
     {
-        var now = Environment.TickCount64;
+        if (Simulated) return false;
+        var now = Now;
         if (now - _fullscreenCheckedAt > 1500)
         {
             _fullscreenCheckedAt = now;
@@ -631,7 +643,7 @@ internal sealed class Engine : IDisposable
     public string Diagnostics()
     {
         var fgProc = ForegroundProcess() ?? "?";
-        long sinceKey = LastHookKeyTick == 0 ? -1 : (Environment.TickCount64 - LastHookKeyTick) / 1000;
+        long sinceKey = LastHookKeyTick == 0 ? -1 : (Now - LastHookKeyTick) / 1000;
         var lines = new List<string>
         {
             $"Перехват клавиатуры: {(_kbHook != IntPtr.Zero ? "установлен" : "НЕТ")}, последнее нажатие {(sinceKey < 0 ? "ещё не было" : $"{sinceKey} с назад")}",
@@ -724,18 +736,18 @@ internal sealed class Engine : IDisposable
             }
             if (newText != oldText)
             {
-                InputSender.ReleaseModifiers(_held.Where(v => v is 0xA0 or 0xA1));
-                InputSender.Backspace(count);
-                InputSender.Text(newText);
+                Out.ReleaseModifiers(_held.Where(v => v is 0xA0 or 0xA1));
+                Out.Backspace(count);
+                Out.Text(newText);
                 if (renderLang != cur) _layouts.Switch(renderLang);
-                if (capsOff) InputSender.Tap(VK_CAPITAL);
-                InputSender.Tap(vk);
+                if (capsOff) Out.Tap(VK_CAPITAL);
+                Out.Tap(vk);
                 swallow = true;
 
                 _line.RemoveRange(start, count);
                 _line.InsertRange(start, newKeys);
                 if (vk == VK_SPACE)
-                    _lastAuto = new AutoFix(word, count, cur, renderLang != cur, oldText, newText, false);
+                    _lastAuto = new AutoFix(word, count, cur, renderLang != cur, oldText, newText, false) { Tick = Now };
                 AddLog(oldText, newText, string.Join(", ", kinds));
                 if (_s.SoundOnAutoSwitch) Task.Run(() => Console.Beep(1400, 25));
             }
@@ -769,9 +781,16 @@ internal sealed class Engine : IDisposable
         _midWordTried = true;
         _midWordFixed = true;
         var newText = LayoutMap.Render(keys, d.Target);
-        InputSender.ReleaseModifiers(_held.Where(v => v is 0xA0 or 0xA1));
-        InputSender.Backspace(count - 1);   // the current key hasn't reached the app yet: we swallow it
-        InputSender.Text(newText);
+        int erase = count - 1;      // the current key hasn't reached the app yet: we swallow it
+        if (ShortWordBefore(start, cur, d.Target) is { } pw)
+        {
+            var prevKeys = _line.GetRange(pw.start, start - pw.start);   // short word + the space after it
+            newText = LayoutMap.Render(prevKeys, d.Target) + newText;
+            erase += start - pw.start;
+        }
+        Out.ReleaseModifiers(_held.Where(v => v is 0xA0 or 0xA1));
+        Out.Backspace(erase);
+        Out.Text(newText);
         _layouts.Switch(d.Target);
         _wordStartLang = d.Target;
         _lastLangSeen = d.Target;
@@ -873,8 +892,8 @@ internal sealed class Engine : IDisposable
         var fg = GetForegroundWindow();
         if (needsPaste && IsTerminal(fg)) return false; // a newline pasted into a shell would execute it
 
-        InputSender.ReleaseModifiers(_held.Where(v => v is 0xA0 or 0xA1));
-        InputSender.Backspace(count);
+        Out.ReleaseModifiers(_held.Where(v => v is 0xA0 or 0xA1));
+        Out.Backspace(count);
         if (needsPaste)
         {
             _ui.Post(async _ =>
@@ -885,24 +904,24 @@ internal sealed class Engine : IDisposable
                     if (!await PasteViaClipboard(text, fg))
                     {
                         // Couldn't paste (clipboard locked / window changed): put the abbreviation back.
-                        if (GetForegroundWindow() == fg) InputSender.Text(typed);
+                        if (GetForegroundWindow() == fg) Out.Text(typed);
                         Notify?.Invoke("Не удалось вставить текст автозамены");
                         return;
                     }
-                    InputSender.Tap(vk);
+                    Out.Tap(vk);
                 }
                 finally { _busy = false; }
             }, null);
         }
         else
         {
-            InputSender.Text(text);
-            InputSender.Tap(vk);
+            Out.Text(text);
+            Out.Tap(vk);
         }
 
         ResetLine();
         if (vk == VK_SPACE)
-            _lastAuto = new AutoFix(word, VisibleLength(text), _layouts.Current() ?? Lang.En, false, typed, text, true);
+            _lastAuto = new AutoFix(word, VisibleLength(text), _layouts.Current() ?? Lang.En, false, typed, text, true) { Tick = Now };
         AddLog(typed, Shorten(text), "автозамена");
         return true;
     }
@@ -911,8 +930,8 @@ internal sealed class Engine : IDisposable
     {
         var a = _lastAuto!;
         _lastAuto = null;
-        InputSender.Backspace(a.ConvertedLength + 1);
-        InputSender.Text(a.Original + " ");
+        Out.Backspace(a.ConvertedLength + 1);
+        Out.Text(a.Original + " ");
         if (a.Switched) _layouts.Switch(a.From);
         if (a.IsSnippet)
         {
@@ -1127,9 +1146,9 @@ internal sealed class Engine : IDisposable
             LearnFromManual(LanguageDetector.Core(before, cur), target);
         _lastAuto = null;
 
-        InputSender.ReleaseModifiers(_held);
-        InputSender.Backspace(count);
-        InputSender.Text(after);
+        Out.ReleaseModifiers(_held);
+        Out.Backspace(count);
+        Out.Text(after);
         _layouts.Switch(target);
         if (LayoutMap.IsCyrillicLang(target)) _lastCyrillic = target;
         AddLog(before, after, phrase ? "фраза (вручную)" : "слово (вручную)");
@@ -1148,9 +1167,9 @@ internal sealed class Engine : IDisposable
         var result = f(trimmed) + text[trimmed.Length..];
         if (result == text) return true;
 
-        InputSender.ReleaseModifiers(_held);
-        InputSender.Backspace(count);
-        InputSender.Text(result);
+        Out.ReleaseModifiers(_held);
+        Out.Backspace(count);
+        Out.Text(result);
 
         if (result.Length == text.Length)
         {
@@ -1238,7 +1257,7 @@ internal sealed class Engine : IDisposable
                 try { Clipboard.SetText(text, TextDataFormat.UnicodeText); break; }
                 catch (ExternalException) { await Task.Delay(30); }
             }
-            InputSender.ReleaseModifiers(_held);
+            Out.ReleaseModifiers(_held);
             InputSender.Combo(VK_CONTROL_L, VK_V);
         }
         finally
@@ -1266,7 +1285,7 @@ internal sealed class Engine : IDisposable
         bool changed = false; // only then is the line buffer out of date; otherwise the user may already be typing
         try
         {
-            InputSender.ReleaseModifiers(_held);
+            Out.ReleaseModifiers(_held);
             await _clipboard.WaitAvailableAsync();
             var backup = ClipboardBackup.Save();
             uint seq = GetClipboardSequenceNumber();
